@@ -3,7 +3,7 @@ import subprocess
 
 def run_tests(project_path):
     result = subprocess.run(
-        ["pytest", "tests"],
+        ["python3", "-m", "pytest", "tests"],
         cwd=project_path,
         capture_output=True,
         text=True

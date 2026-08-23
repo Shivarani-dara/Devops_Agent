@@ -8,77 +8,197 @@ def scan_project(project_path):
             f"Project directory not found: {project_path}"
         )
 
-    files = os.listdir(project_path)
+    # ============================================================
+    # FIND ALL FILES RECURSIVELY
+    # ============================================================
+
+    all_files = []
+
+    for root, dirs, files in os.walk(project_path):
+
+        # Ignore unnecessary directories
+        dirs[:] = [
+            d for d in dirs
+            if d not in {
+                "__pycache__",
+                ".pytest_cache",
+                ".git",
+                "venv",
+                ".venv"
+            }
+        ]
+
+        for file in files:
+
+            full_path = os.path.join(root, file)
+
+            relative_path = os.path.relpath(
+                full_path,
+                project_path
+            )
+
+            all_files.append(relative_path)
+
+    # ============================================================
+    # PROJECT INFORMATION
+    # ============================================================
 
     project_info = {
         "project_path": project_path,
-        "files": files,
+        "files": all_files,
+
         "type": "unknown",
+
         "entry_point": None,
+
         "requirements_file": None,
-        "test_framework": None
-    }
 
-    # -----------------------------
-    # Detect Python
-    # -----------------------------
+        "test_framework": None,
 
-    if "requirements.txt" in files or any(
-        file.endswith(".py") for file in files
-    ):
+        "source_files": [],
+
+        "test_files": [],
+
+        "dockerfile": None,
+        "dockerignore": None,
+        "jenkinsfile": None
+            }
+
+    # ============================================================
+    # DETECT PYTHON
+    # ============================================================
+
+    if any(file.endswith(".py") for file in all_files):
+
         project_info["type"] = "python"
 
-    # -----------------------------
-    # Detect Node.js
-    # -----------------------------
+    # ============================================================
+    # DEVOPS FILES
+    # ============================================================
 
-    if "package.json" in files:
+    if "Dockerfile" in all_files:
+        project_info["dockerfile"] = "Dockerfile"
+
+    if ".dockerignore" in all_files:
+        project_info["dockerignore"] = ".dockerignore"
+
+    if "Jenkinsfile" in all_files:
+        project_info["jenkinsfile"] = "Jenkinsfile"
+
+    # ============================================================
+    # DETECT NODE.JS
+    # ============================================================
+
+    if "package.json" in all_files:
+
         project_info["type"] = "node"
 
-    # -----------------------------
-    # Detect Java / Maven
-    # -----------------------------
+    # ============================================================
+    # DETECT JAVA / MAVEN
+    # ============================================================
 
-    if "pom.xml" in files:
+    if "pom.xml" in all_files:
+
         project_info["type"] = "java-maven"
 
-    # -----------------------------
-    # Detect Python entry point
-    # -----------------------------
+    
+
+    # ============================================================
+    # PYTHON PROJECT
+    # ============================================================
 
     if project_info["type"] == "python":
 
-        if "app.py" in files:
+        # --------------------------------------------------------
+        # Find Python source files
+        # --------------------------------------------------------
+
+        for file in all_files:
+
+            if not file.endswith(".py"):
+                continue
+
+            # Ignore test files
+            if (
+                file.startswith("tests/")
+                or file.startswith("test/")
+                or os.path.basename(file).startswith("test_")
+                or os.path.basename(file).endswith("_test.py")
+            ):
+                continue
+
+            project_info["source_files"].append(file)
+
+        # --------------------------------------------------------
+        # Find test files
+        # --------------------------------------------------------
+
+        for file in all_files:
+
+            if not file.endswith(".py"):
+                continue
+
+            filename = os.path.basename(file)
+
+            if (
+                file.startswith("tests/")
+                or file.startswith("test/")
+                or filename.startswith("test_")
+                or filename.endswith("_test.py")
+            ):
+                project_info["test_files"].append(file)
+
+        # --------------------------------------------------------
+        # Detect entry point
+        # --------------------------------------------------------
+
+        if "app.py" in all_files:
+
             project_info["entry_point"] = "app.py"
 
-        elif "main.py" in files:
+        elif "main.py" in all_files:
+
             project_info["entry_point"] = "main.py"
 
-    # -----------------------------
-    # Dependencies
-    # -----------------------------
+        elif "__main__.py" in all_files:
 
-    if "requirements.txt" in files:
-        project_info["requirements_file"] = "requirements.txt"
+            project_info["entry_point"] = "__main__.py"
 
-    # -----------------------------
-    # Detect pytest
-    # -----------------------------
+        # --------------------------------------------------------
+        # Requirements
+        # --------------------------------------------------------
 
-    if (
-        "pytest.ini" in files
-        or "pyproject.toml" in files
-        or "tests" in files
-    ):
-        project_info["test_framework"] = "pytest"
+        if "requirements.txt" in all_files:
+
+            project_info["requirements_file"] = "requirements.txt"
+
+        # --------------------------------------------------------
+        # Detect pytest
+        # --------------------------------------------------------
+
+        if (
+            "pytest.ini" in all_files
+            or "pyproject.toml" in all_files
+            or len(project_info["test_files"]) > 0
+        ):
+            project_info["test_framework"] = "pytest"
 
     return project_info
 
 
+# ================================================================
+# TEST SCANNER DIRECTLY
+# ================================================================
 
 if __name__ == "__main__":
 
     import sys
+
+    if len(sys.argv) != 2:
+
+        print("Usage: python3 scanner.py <project_path>")
+
+        sys.exit(1)
 
     project_path = sys.argv[1]
 
@@ -87,4 +207,5 @@ if __name__ == "__main__":
     print("\n===== PROJECT INFORMATION =====")
 
     for key, value in info.items():
+
         print(f"{key}: {value}")
