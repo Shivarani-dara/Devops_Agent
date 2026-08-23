@@ -4,7 +4,7 @@ import sys
 import os
 
 from tools.file_tools import read_file, modify_file
-from core.validator import (validate_python_fix,validate_dockerfile_fix)
+from core.validator import (validate_python_fix,validate_dockerfile_fix,validate_dockerignore_fix)
 
 from project.scanner import scan_project
 from project.runner import run_project
@@ -1066,6 +1066,11 @@ ERROR:
     ):
         allowed_files.append("Dockerfile")
 
+    if os.path.exists(
+        os.path.join(project_path, ".dockerignore")
+    ):
+        allowed_files.append(".dockerignore")
+
     project_root = os.path.abspath(project_path)
 
     raw_selected_file = fix["file"]
@@ -1229,6 +1234,14 @@ ERROR:
     if fix["file"] == "Dockerfile":
 
         validation = validate_dockerfile_fix(
+            code,
+            fix["old"],
+            fix["new"]
+        )
+
+    elif fix["file"] == ".dockerignore":
+
+        validation = validate_dockerignore_fix(
             code,
             fix["old"],
             fix["new"]

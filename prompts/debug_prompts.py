@@ -474,7 +474,7 @@ def docker_failure_prompt(
     error,
     code,
     dockerfile,
-    dockeringnore,
+    dockerignore,
     project_info,
     failed_fix_info=""
 ):
@@ -541,12 +541,6 @@ DOCKERFILE
 
 
 ==================================================
-DOCKERFILE
-==================================================
-
-{dockerfile}
-
-==================================================
 DOCKERIGNORE
 ==================================================
 
@@ -601,12 +595,18 @@ Follow this process:
 
 5. Identify WHICH PROJECT FILE owns the failing instruction.
 
-IMPORTANT FILE OWNERSHIP RULES:
+- If the error is "can't open file '<something>.py'" or a similar
+  "file not found" error happening when the CONTAINER STARTS (not
+  during the build), the CMD or ENTRYPOINT line is almost certainly
+  running the WRONG FILENAME — not a wrong path, a wrong filename.
 
-- If the error mentions FROM, base image, image tag, Dockerfile
-  instruction, WORKDIR, COPY, RUN, CMD, ENTRYPOINT, ENV, EXPOSE,
-  Docker build context, or Docker build configuration:
-  MODIFY THE DOCKERFILE.
+  The correct filename is the "Entry file" value shown in the
+  PROJECT section above (currently: "{app_file}"). If CMD or
+  ENTRYPOINT references any other filename, replace that filename
+  with "{app_file}" exactly. Do NOT just add a directory path in
+  front of the wrong filename — the filename itself is incorrect
+  and must be replaced. Do NOT modify COPY instructions for this
+  type of error.
 
 - If the error occurs while installing Python dependencies and
   specifically identifies requirements.txt as the problem:

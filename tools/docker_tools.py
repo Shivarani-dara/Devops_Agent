@@ -229,9 +229,7 @@ def build_and_run_docker(
             "docker",
             "run",
             "--rm",
-            image_name,
-            "python",
-            entry_point
+            image_name
         ],
         capture_output=True,
         text=True

@@ -211,3 +211,44 @@ def validate_dockerfile_fix(content, old_text, new_text):
         "content": modified_content,
         "resolved_old": old_text
     }
+
+def validate_dockerignore_fix(content, old_text, new_text):
+
+    if not old_text or not old_text.strip():
+        return {
+            "valid": False,
+            "reason": "OLD value is empty."
+        }
+
+    if old_text not in content:
+        return {
+            "valid": False,
+            "reason": "OLD Dockerignore text was not found in the current .dockerignore file."
+        }
+
+    occurrence_count = content.count(old_text)
+
+    if occurrence_count > 1:
+        return {
+            "valid": False,
+            "reason": "OLD text appears more than once in .dockerignore; it must be unique."
+        }
+
+    if old_text == new_text:
+        return {
+            "valid": False,
+            "reason": "OLD and NEW are identical; no actual change proposed."
+        }
+
+    modified_content = content.replace(
+        old_text,
+        new_text,
+        1
+    )
+
+    return {
+        "valid": True,
+        "reason": "Proposed .dockerignore change is structurally valid.",
+        "content": modified_content,
+        "resolved_old": old_text
+    }
