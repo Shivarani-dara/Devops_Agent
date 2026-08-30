@@ -2,9 +2,17 @@ import ollama
 import json
 import sys
 import os
+import re
+import subprocess
 
 from tools.file_tools import read_file, modify_file
-from core.validator import (validate_python_fix,validate_dockerfile_fix,validate_dockerignore_fix)
+from core.validator import (validate_python_fix,validate_dockerfile_fix,validate_dockerignore_fix,validate_requirements_fix)
+from core.error_policy import (
+    classify_application_error,
+    extract_missing_module,
+    get_allowed_fix_files,
+    is_allowed_fix_file
+)
 
 from project.scanner import scan_project
 from project.runner import run_project
@@ -23,7 +31,7 @@ from tools.git_tools import (
     git_commit_success
 )
 
-import re
+
 
 def count_failed_tests(test_stdout):
     match = re.search(r'(\d+) failed', test_stdout)
@@ -799,6 +807,37 @@ ERROR:
 
     else:
 
+        error_type = classify_application_error(error)
+
+        missing_module = extract_missing_module(error)
+
+        print(
+            f"\n===== ERROR TYPE: {error_type} ====="
+        )
+
+        if missing_module:
+            print(
+                f"===== MISSING MODULE: {missing_module} ====="
+            )
+
+        allowed_fix_files = get_allowed_fix_files(
+            error_type,
+            project_info
+        )
+
+        print(
+            f"===== ALLOWED FIX FILES: {allowed_fix_files} ====="
+        )
+
+        requirements_path = os.path.join(
+            project_path,
+            project_info.get("requirements_file") or "requirements.txt"
+        )
+
+        if os.path.exists(requirements_path):
+            requirements_content = read_file(requirements_path)
+        else:
+            requirements_content = ""
         prompt = application_error_prompt(
             project_path,
             app_file,
@@ -808,8 +847,11 @@ ERROR:
                 "source_files",
                 []
             ),
+            requirements_content,
+            error_type=error_type,
+            allowed_fix_files=allowed_fix_files,
             failed_fix_info=failed_fix_info
-        )
+        )+extra_instructions
 
 
     # ========================================================
@@ -1071,7 +1113,27 @@ ERROR:
     ):
         allowed_files.append(".dockerignore")
 
+    if project_info.get("requirements_file"):
+        allowed_files.append(project_info["requirements_file"])
+
+    # ========================================================
+    # ERROR-SPECIFIC FILE POLICY
+    # ========================================================
+
+    if debug_type == "application":
+
+        policy_allowed_files = get_allowed_fix_files(
+            error_type,
+            project_info
+        )
+
+        if policy_allowed_files:
+            allowed_files = policy_allowed_files
+
+
     project_root = os.path.abspath(project_path)
+
+
 
     raw_selected_file = fix["file"]
 
@@ -1133,6 +1195,19 @@ ERROR:
         )
 
         print(fix["file"])
+
+        extra_instructions = (
+            "\n\nIMPORTANT CORRECTION: Your previous answer proposed "
+            f"modifying '{fix.get('file', '')}', but that file is not "
+            f"allowed for this type of error. The ONLY file you are "
+            f"permitted to modify right now is: {allowed_files}. "
+            "You MUST set \"file\" to one of the files in that list. "
+            "Do not propose any other file."
+        )
+
+        if attempt == MAX_ATTEMPTS:
+            print("\n❌ Maximum attempts reached.")
+            break
 
         continue
 
@@ -1247,6 +1322,14 @@ ERROR:
             fix["new"]
         )
 
+    elif fix["file"] == "requirements.txt":
+
+        validation = validate_requirements_fix(
+            requirements_content,
+            fix["old"],
+            fix["new"]
+        )
+
     else:
 
         validation = validate_python_fix(
@@ -1261,8 +1344,12 @@ ERROR:
         print("REASON:")
         print(validation["reason"])
 
-        print("\n===== IMPORTANT: CURRENT SOURCE CODE =====")
-        print(code)
+        print("\n===== IMPORTANT: CURRENT FILE CONTENT =====")
+
+        if fix["file"] == "requirements.txt":
+            print(requirements_content)
+        else:
+            print(code)
 
         print("\nThe next AI response MUST choose 'old' from the source above.")
 
@@ -1374,6 +1461,42 @@ ERROR:
     print(
         "\n===== VERIFYING FIX ====="
     )
+
+    if fix["file"] == "requirements.txt":
+        print(
+            "\n===== INSTALLING UPDATED DEPENDENCIES ====="
+        )
+        requirements_path_for_install = os.path.join(
+            project_path,
+            project_info.get("requirements_file") or "requirements.txt"
+        )
+
+        pip_install_result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                requirements_path_for_install
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        print(pip_install_result.stdout)
+
+        if pip_install_result.returncode != 0:
+            print(
+                "\n⚠️ pip install failed:"
+            )
+            print(pip_install_result.stderr)
+        else:
+            print(
+                "✅ Dependencies installed successfully."
+            )
+
+    
 
 
     verify = run_project(

@@ -4,9 +4,14 @@ def application_error_prompt(
     error,
     code,
     source_files,
+    requirements_content,
+    error_type="unknown",
+    allowed_fix_files=None,
     failed_fix_info=""
 ):
-    return f"""
+        if allowed_fix_files is None:
+           allowed_fix_files = []
+        return f"""
 You are a Python debugging agent.
 
 Your task is to diagnose the ACTUAL application error and propose ONE
@@ -14,7 +19,10 @@ minimal source-code fix.
 
 Do not guess.
 Do not use examples from this prompt as source code.
-The CURRENT SOURCE CODE below is the only authority for the "old" field.
+For source-code fixes, CURRENT SOURCE CODE is the authority for the "old" field.
+
+For requirements.txt fixes, CURRENT REQUIREMENTS FILE CONTENTS is the authority
+for the "old" field.
 
 ==================================================
 PROJECT
@@ -28,6 +36,10 @@ Entry file:
 
 Available source files:
 {source_files}
+
+
+Dependency/configuration files that may be modified when appropriate:
+requirements.txt
 
 ==================================================
 APPLICATION ERROR
@@ -53,7 +65,11 @@ Previous failed attempts refer to older attempts.
 
 NEVER copy the "old" value from PREVIOUS FAILED ATTEMPTS.
 
-The "old" value MUST come directly from CURRENT SOURCE CODE above.
+For Python source-code fixes:
+The "old" value MUST come directly from CURRENT SOURCE CODE.
+
+For requirements.txt fixes:
+The "old" value MUST come directly from CURRENT REQUIREMENTS FILE CONTENTS.
 
 ==================================================
 DEBUGGING PROCESS
@@ -108,8 +124,11 @@ Before returning the answer, mentally perform:
     Does CURRENT SOURCE CODE literally contain my "old" value?
 
 If the answer is NO, your answer is invalid.
+For Python source-code fixes, never return an empty "old" value.
 
-Do not return an empty "old" value.
+For requirements.txt:
+- If the current requirements.txt is empty, "old" may be "".
+- If requirements.txt is not empty, "old" MUST contain its exact current contents.
 
 Do not invent an "old" value.
 
@@ -167,7 +186,6 @@ Do not automatically add conversions such as int(), str(),
 or isinstance() unless the source code and program behavior
 justify that change.
 
-==================================================
 NAMEERROR
 ==================================================
 
@@ -183,6 +201,47 @@ If the error is NameError:
 
 Do not delete the line that uses the missing name.
 
+==================================================
+MODULENOTFOUNDERROR
+==================================================
+
+If the error is:
+
+    ModuleNotFoundError: No module named 'X'
+
+You MUST first determine whether X is genuinely used anywhere in
+the current source code (an actual import that is referenced,
+not a leftover unused import).
+
+CURRENT REQUIREMENTS FILE CONTENTS:
+
+{requirements_content}
+
+Follow this decision process:
+
+1. If X IS used in the source code, and X is MISSING from the
+   requirements file above, the fix is to add X to
+   requirements.txt. Do NOT modify app.py. Do NOT remove the
+   import. Do NOT invent new application code, new classes, new
+   app initialization, or any functionality that was not already
+   present in the source.
+
+   Example correct fix in this case:
+   {{
+       "file": "requirements.txt",
+       "old": "<the exact current contents of requirements.txt>",
+       "new": "<the exact current contents, plus X added>",
+       "reason": "X is imported by the application but missing from requirements.txt"
+   }}
+
+2. If X is imported but NEVER actually used anywhere else in the
+   source code (a genuinely unused import), the fix is to remove
+   that one import line from the source file. Do NOT add X to
+   requirements.txt in this case.
+
+3. Never do both at once. Pick exactly one: add the dependency,
+   OR remove the unused import — based on whether X is actually
+   used in the code.
 ==================================================
 INDEXERROR / KEYERROR
 ==================================================
@@ -217,35 +276,42 @@ Do not repeat the same file/old/new combination.
 Do not copy their "old" or "new" text.
 
 Always inspect CURRENT SOURCE CODE again.
-
 ==================================================
 FINAL VALIDATION
 ==================================================
 
 Before returning the answer verify:
 
-1. file is exactly one of:
+1. "file" is exactly one of:
 
 {source_files}
 
-2. old literally exists in CURRENT SOURCE CODE.
+or "requirements.txt" ONLY for dependency-related errors.
 
-3. old was copied character-for-character.
+2. For Python source-code fixes:
+   "old" MUST be copied exactly from CURRENT SOURCE CODE.
 
-4. old is not empty.
+3. For requirements.txt fixes:
+   "old" MUST be copied exactly from CURRENT REQUIREMENTS FILE CONTENTS.
 
-5. old contains only source code.
+4. For Python source-code fixes, "old" MUST NOT be empty.
 
-6. new contains only replacement source code.
+5. For requirements.txt, "old" may be empty ONLY if
+   CURRENT REQUIREMENTS FILE CONTENTS is completely empty.
 
-7. new is valid Python.
+6. "old" must be copied character-for-character.
 
-8. the fix addresses the actual error.
+7. "new" must contain only replacement content.
 
-9. the fix is minimal.
+8. If file is a Python source file, "new" must be valid Python.
 
-10. no test was modified.
+9. If file is requirements.txt, "new" must be valid requirements.txt content.
 
+10. The fix must address the actual error.
+
+11. The fix must be minimal.
+
+12. No test must be modified.
 ==================================================
 OUTPUT
 ==================================================

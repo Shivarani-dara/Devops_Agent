@@ -252,3 +252,49 @@ def validate_dockerignore_fix(content, old_text, new_text):
         "content": modified_content,
         "resolved_old": old_text
     }
+
+
+
+
+
+def validate_requirements_fix(content, old_text, new_text):
+    """
+    Validate a generic text-file change without modifying the actual file.
+    """
+
+    # Empty OLD is valid when the file itself is empty.
+    if old_text == "":
+        if content.strip() != "":
+            return {
+                "valid": False,
+                "reason": (
+                    "OLD is empty but the current file is not empty. "
+                    "The AI must provide the exact existing file contents."
+                )
+            }
+
+    # OLD must exist in the current file.
+    elif old_text not in content:
+        return {
+            "valid": False,
+            "reason": "OLD text was not found in the file."
+        }
+
+    # OLD and NEW must differ.
+    if old_text == new_text:
+        return {
+            "valid": False,
+            "reason": "OLD and NEW are identical."
+        }
+
+    # Make sure the replacement can actually be performed.
+       # Make sure the replacement can actually be performed.
+    modified_content = content.replace(old_text, new_text, 1)
+    return {
+        "valid": True,
+        "reason": "Text file change is valid.",
+        "modified_content": modified_content,
+        "resolved_old": old_text
+    }
+
+    
