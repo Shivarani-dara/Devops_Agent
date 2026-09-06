@@ -661,18 +661,26 @@ Follow this process:
 
 5. Identify WHICH PROJECT FILE owns the failing instruction.
 
-- If the error is "can't open file '<something>.py'" or a similar
-  "file not found" error happening when the CONTAINER STARTS (not
-  during the build), the CMD or ENTRYPOINT line is almost certainly
-  running the WRONG FILENAME — not a wrong path, a wrong filename.
+- If the error is "can't open file '<something>.py'" or another
+  file-not-found error during CONTAINER STARTUP, trace the file
+  from the startup command to the Docker image.
 
-  The correct filename is the "Entry file" value shown in the
-  PROJECT section above (currently: "{app_file}"). If CMD or
-  ENTRYPOINT references any other filename, replace that filename
-  with "{app_file}" exactly. Do NOT just add a directory path in
-  front of the wrong filename — the filename itself is incorrect
-  and must be replaced. Do NOT modify COPY instructions for this
-  type of error.
+  First check CMD or ENTRYPOINT:
+  - If it references the WRONG filename, fix the filename.
+  - If it already references the correct Entry file "{app_file}",
+    DO NOT modify CMD or ENTRYPOINT.
+
+  If CMD/ENTRYPOINT is already correct, inspect:
+  1. WORKDIR
+  2. COPY or ADD instructions
+  3. .dockerignore
+
+  If the required entry file "{app_file}" is listed in .dockerignore,
+  the .dockerignore entry is the root cause because Docker excludes
+  that file from COPY . .
+
+  In that case, modify .dockerignore by removing ONLY the exact
+  line containing "{app_file}".
 
 - If the error occurs while installing Python dependencies and
   specifically identifies requirements.txt as the problem:

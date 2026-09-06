@@ -1,4 +1,4 @@
-import ollama
+from llm.client import LLMClient
 import json
 import sys
 import os
@@ -17,8 +17,13 @@ from core.error_policy import (
 from project.scanner import scan_project
 from project.runner import run_project
 
+
+from core.state import AgentState
+from core.docker_validation import validate_docker
+
+
 from tools.test_tools import run_tests
-from tools.docker_tools import (build_and_run_docker,ensure_dockerfile)
+from tools.docker_tools import ensure_dockerfile
 
 from prompts.debug_prompts import (
     application_error_prompt,
@@ -40,37 +45,6 @@ def count_failed_tests(test_stdout):
     return 0
 
 
-def is_docker_infrastructure_error(docker_result):
-    build_error = docker_result.get("build_stderr", "")
-    run_error = docker_result.get("run_stderr", "")
-
-    combined_error = (
-        build_error + "\n" + run_error
-    ).lower()
-
-    # Signals that strongly suggest a REAL infrastructure/network
-    # problem — NOT just "this image tag doesn't exist".
-    #
-    # NOTE: "403 forbidden", "docker.io", and "mirror.gcr.io" were
-    # intentionally removed. They appear on both genuine outages AND
-    # ordinary invalid-tag errors (every tag resolution attempt
-    # touches docker.io/mirror.gcr.io and can 403 either way), so
-    # they can't reliably distinguish the two cases.
-    strong_infra_signals = [
-        "connection refused",
-        "connection reset",
-        "network is unreachable",
-        "timeout",
-        "temporary failure",
-        "dns",
-        "could not resolve host",
-    ]
-
-    return any(
-        signal in combined_error
-        for signal in strong_infra_signals
-    )
-
 
 def build_test_info(project_path, project_info, test_result):
     test_source = ""
@@ -91,6 +65,10 @@ Test return code:
 ================ TEST SOURCE CODE ================
 {test_source}
 """
+
+def fix_signature(fix):
+    return (fix["file"], fix["old"], fix["new"])
+
 
 def is_repeated_fix(candidate_fix, failed_fixes):
     """
@@ -178,6 +156,7 @@ test_info = ""
 last_error = ""
 
 stored_debug_type = None
+repeated_fix_counts = {}
 
 last_failed_count = float("inf") 
 
@@ -193,140 +172,310 @@ attempt = 0
 extra_instructions = ""
 
 
-while attempt < MAX_ATTEMPTS:
+state = AgentState()
+
+llm_client = LLMClient()
+
+
+
+# ============================================================
+# MAIN AGENT LOOP
+# ============================================================
+
+def run_agent_loop(project_path, project_info, state, llm_client):
+
+    while state.attempt < MAX_ATTEMPTS:
 
     
 
-    attempt += 1
+        state.attempt += 1
 
 
-    print("\n==============================")
-    print(f"       ATTEMPT {attempt}")
-    print("==============================")
+        print("\n==============================")
+        print(f"       ATTEMPT {state.attempt}")
+        print("==============================")
 
-    debug_type = stored_debug_type if stored_debug_type else "application"
-
-
-    # ========================================================
-    # RUN PROJECT
-    # ========================================================
-
-    if not error:
-
-        result = run_project(project_info)
+        debug_type = state.stored_debug_type if state.stored_debug_type else "application"
 
 
-        # ----------------------------------------------------
-        # APPLICATION FAILED
-        # ----------------------------------------------------
+        # ========================================================
+        # RUN PROJECT
+        # ========================================================
 
-        if result["returncode"] != 0:
+        if not state.error:
 
-            print("\n=== APPLICATION ERROR ===")
-            print(result["stderr"])
-
-            error = result["stderr"]
-
-            last_error = result["stderr"]
+            result = run_project(project_info)
 
 
-        # ----------------------------------------------------
-        # APPLICATION SUCCESSFUL
-        # ----------------------------------------------------
+            # ----------------------------------------------------
+            # APPLICATION FAILED
+            # ----------------------------------------------------
 
-        else:
+            if result["returncode"] != 0:
 
-            print("\n✅ APPLICATION RUNS SUCCESSFULLY")
+                print("\n=== APPLICATION ERROR ===")
+                print(result["stderr"])
 
-            print("\nAPPLICATION OUTPUT:")
-            print(result["stdout"])
+                state.error = result["stderr"]
 
-
-            # =================================================
-            # RUN TESTS
-            # =================================================
-
-            if project_info.get("test_framework"):
-
-                print("\n===== RUNNING TESTS =====")
+                state.last_error = result["stderr"]
 
 
-                test_result = run_tests(project_path)
+            # ----------------------------------------------------
+            # APPLICATION SUCCESSFUL
+            # ----------------------------------------------------
+
+            else:
+
+                print("\n✅ APPLICATION RUNS SUCCESSFULLY")
+
+                print("\nAPPLICATION OUTPUT:")
+                print(result["stdout"])
 
 
-                print("\n===== TEST OUTPUT =====")
-                print(test_result["stdout"])
+                # =================================================
+                # RUN TESTS
+                # =================================================
+
+                if project_info.get("test_framework"):
+
+                    print("\n===== RUNNING TESTS =====")
 
 
-                if test_result["stderr"]:
-
-                    print("\n===== TEST ERROR =====")
-                    print(test_result["stderr"])
+                    test_result = run_tests(project_path)
 
 
-                print("\n===== TEST RETURN CODE =====")
-                print(test_result["returncode"])
+                    print("\n===== TEST OUTPUT =====")
+                    print(test_result["stdout"])
 
 
-                # ------------------------------------------------
-                # TESTS PASS
-                # ------------------------------------------------
-                if test_result["returncode"] == 0:
-                    print("\n✅ ALL TESTS PASSED")
-                    # =================================================
-                    # DOCKER VALIDATION (runs BEFORE commit — commit
-                    # only happens if Docker also passes, below)
-                    # =================================================
-                    # =================================================
-                    # DOCKER VALIDATION
-                    # =================================================
+                    if test_result["stderr"]:
 
-                    print("\n===== PREPARING DOCKER VALIDATION =====")
+                        print("\n===== TEST ERROR =====")
+                        print(test_result["stderr"])
+
+
+                    print("\n===== TEST RETURN CODE =====")
+                    print(test_result["returncode"])
+
+
+                    # ------------------------------------------------
+                    # TESTS PASS
+                    # ------------------------------------------------
+                    if test_result["returncode"] == 0:
+                        print("\n✅ ALL TESTS PASSED")
+                        # =================================================
+                        # DOCKER VALIDATION (runs BEFORE commit — commit
+                        # only happens if Docker also passes, below)
+                        # =================================================
+                        # =================================================
+                        # DOCKER VALIDATION
+                        # =================================================
+
+                        print("\n===== PREPARING DOCKER VALIDATION =====")
 
 
         
 
-                     # =================================================
-                    # DOCKER VALIDATION
-                    # ================================================
+                         # =================================================
+                        # DOCKER VALIDATION
+                        # ================================================
 
 
 
                                                     
 
-                    print("\n===== RUNNING DOCKER VALIDATION =====")
+                        docker_result, debug_type = validate_docker(
+                            project_path,
+                            project_info
+                        )
 
-                    docker_result = build_and_run_docker(
+
+                        # =================================================
+                        # DOCKER PASSED
+                        # =================================================
+
+                        if (
+                            docker_result["build_returncode"] == 0
+                            and docker_result["run_returncode"] == 0
+                        ):
+
+                            print("\n✅ DOCKER VALIDATION PASSED")
+
+                            # =============================================
+                            # COMMIT SUCCESSFUL FIX
+                            # =============================================
+
+                            print("\n===== COMMITTING SUCCESSFUL FIX =====")
+
+                            commit_result = git_commit_success(
+                                project_path
+                            )
+
+                            if not commit_result["success"]:
+
+                                print("\n❌ Could not commit successful fix.")
+                                print(commit_result["stderr"])
+
+                                break
+
+                            print("✅ Successful fix committed.")
+
+                            print("\n🎉 PROJECT SUCCESSFUL")
+
+                            break
+
+
+                        # =================================================
+                        # DOCKER FAILED
+                        # =================================================
+
+                        else:
+
+                            print("\n❌ DOCKER VALIDATION FAILED")
+
+                            state.stored_debug_type = debug_type
+
+                            print(
+                                f"\n===== DEBUG: CLASSIFIED FAILURE AS: "
+                                f"{debug_type} ====="
+                            )
+
+
+                            state.error = (
+                                "The application and local tests passed, "
+                                "but Docker validation failed.\n\n"
+
+                                "DOCKER BUILD STDOUT:\n"
+                                + docker_result["build_stdout"]
+
+                                + "\n\nDOCKER BUILD STDERR:\n"
+                                + docker_result["build_stderr"]
+
+                                + "\n\nDOCKER BUILD RETURN CODE:\n"
+                                + str(docker_result["build_returncode"])
+
+                                + "\n\nDOCKER CONTAINER STDOUT:\n"
+                                + docker_result["run_stdout"]
+
+                                + "\n\nDOCKER CONTAINER STDERR:\n"
+                                + docker_result["run_stderr"]
+
+                                + "\n\nDOCKER CONTAINER RETURN CODE:\n"
+                                + str(docker_result["run_returncode"])
+                            )
+
+                            state.test_info = build_test_info(
+                                project_path,
+                                project_info,
+                                test_result
+                            )
+
+                            # =============================================
+                            # NO AI FIX EXISTS YET — this is the pre-fix
+                            # (first-run) Docker check, so there is no
+                            # checkpoint to roll back to and no 'fix' to
+                            # log. Just store the error, same as the
+                            # sibling "tests fail" branch above.
+                            # =============================================
+
+                            print(
+                                "\n🔄 Docker failure stored."
+                            )
+
+                            print(
+                                "AI will analyze the Docker failure "
+                                "on the next attempt."
+                            )
+
+                            if state.attempt == MAX_ATTEMPTS:
+
+                                print(
+                                    "\n❌ Maximum attempts reached."
+                                )
+
+                                break
+
+                            continue
+                    # ------------------------------------------------
+                    # TESTS FAIL
+                    # ------------------------------------------------
+
+                    else:
+
+                        print("\n❌ TESTS FAILED")
+
+
+                        # =================================================
+                        # THIS IS THE IMPORTANT PART
+                        #
+                        # At this point there is NO newly applied fix.
+                        #
+                        # This can happen on the FIRST run.
+                        #
+                        # Therefore we DO NOT rollback here.
+                        #
+                        # We simply store the test failure and ask AI
+                        # for a fix.
+                        # =================================================
+
+
+                        state.error = (
+                            "The application runs successfully, "
+                            "but the automated tests are failing.\n\n"
+
+                            "TEST OUTPUT:\n"
+                            + test_result["stdout"]
+
+                            + "\n\nTEST ERROR:\n"
+                            + test_result["stderr"]
+                        )
+
+
+                        state.test_info = build_test_info(project_path, project_info, test_result)
+
+
+                        # Establish the real baseline failing-test count now,
+                        # before any AI fix has been proposed. Without this,
+                        # last_failed_count stays at infinity and the first
+                        # post-fix test-failure count always looks like
+                        # "progress" even when the fix made things worse.
+                        state.last_failed_count = count_failed_tests(test_result["stdout"])
+
+
+                        print("\n🔄 Test failure stored.")
+
+                        print(
+                            "AI will analyze the test failure "
+                            "on the next attempt."
+                        )
+
+
+                        if state.attempt == MAX_ATTEMPTS:
+
+                            print(
+                                "\n❌ Maximum attempts reached."
+                            )
+
+                            break
+
+
+                        continue
+
+
+                # ------------------------------------------------
+                # NO TEST FRAMEWORK
+                # ------------------------------------------------
+
+                else:
+
+                    print("\n⚠️ No test framework detected.")
+
+                    docker_result, debug_type = validate_docker(
                         project_path,
-                        entry_point=project_info["entry_point"],
-                        project_info=project_info
+                        project_info
                     )
 
-                    print("\n===== DOCKER IMAGE =====")
-                    print(docker_result["image_name"])
-
-                    print("\n===== DOCKER BUILD STDOUT =====")
-                    print(docker_result["build_stdout"])
-
-                    print("\n===== DOCKER BUILD STDERR =====")
-                    print(docker_result["build_stderr"])
-
-                    print("\n===== DOCKER BUILD RETURN CODE =====")
-                    print(docker_result["build_returncode"])
-
-                    print("\n===== DOCKER CONTAINER STDOUT =====")
-                    print(docker_result["run_stdout"])
-
-                    print("\n===== DOCKER CONTAINER STDERR =====")
-                    print(docker_result["run_stderr"])
-
-                    print("\n===== DOCKER CONTAINER RETURN CODE =====")
-                    print(docker_result["run_returncode"])
-
-
-                    # =================================================
-                    # DOCKER PASSED
-                    # =================================================
 
                     if (
                         docker_result["build_returncode"] == 0
@@ -335,22 +484,27 @@ while attempt < MAX_ATTEMPTS:
 
                         print("\n✅ DOCKER VALIDATION PASSED")
 
-                        # =============================================
-                        # COMMIT SUCCESSFUL FIX
-                        # =============================================
 
-                        print("\n===== COMMITTING SUCCESSFUL FIX =====")
+                        print(
+                            "\n===== COMMITTING SUCCESSFUL FIX ====="
+                        )
+
 
                         commit_result = git_commit_success(
                             project_path
                         )
 
+
                         if not commit_result["success"]:
 
-                            print("\n❌ Could not commit successful fix.")
+                            print(
+                                "\n❌ Could not commit successful fix."
+                            )
+
                             print(commit_result["stderr"])
 
                             break
+
 
                         print("✅ Successful fix committed.")
 
@@ -359,34 +513,23 @@ while attempt < MAX_ATTEMPTS:
                         break
 
 
-                    # =================================================
-                    # DOCKER FAILED
-                    # =================================================
-
                     else:
 
                         print("\n❌ DOCKER VALIDATION FAILED")
 
-                        if docker_result["build_returncode"] != 0:
-                            debug_type = "docker_build"
-                        else:
-                            debug_type = "docker_runtime"
+                        state.stored_debug_type = debug_type
 
-                        stored_debug_type = debug_type
+                        print(
+                            f"\n===== DEBUG: CLASSIFIED FAILURE AS: "
+                            f"{debug_type} ====="
+                        )
 
-                        print(f"\n===== DEBUG: CLASSIFIED FAILURE AS: {debug_type} =====")
-
-
-                        if is_docker_infrastructure_error(docker_result):
-                            print("\n⚠️ DETECTED EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
-                            print("This looks like a registry/network issue, not a project problem.")
-                            debug_type = "docker_infrastructure"
-                            stored_debug_type = debug_type
+        
 
 
-                        error = (
-                            "The application and local tests passed, "
-                            "but Docker validation failed.\n\n"
+                        state.error = (
+                            "The application passed locally, "
+                            "but failed inside Docker.\n\n"
 
                             "DOCKER BUILD STDOUT:\n"
                             + docker_result["build_stdout"]
@@ -394,31 +537,20 @@ while attempt < MAX_ATTEMPTS:
                             + "\n\nDOCKER BUILD STDERR:\n"
                             + docker_result["build_stderr"]
 
-                            + "\n\nDOCKER BUILD RETURN CODE:\n"
-                            + str(docker_result["build_returncode"])
-
                             + "\n\nDOCKER CONTAINER STDOUT:\n"
                             + docker_result["run_stdout"]
 
                             + "\n\nDOCKER CONTAINER STDERR:\n"
                             + docker_result["run_stderr"]
-
-                            + "\n\nDOCKER CONTAINER RETURN CODE:\n"
-                            + str(docker_result["run_returncode"])
                         )
 
-                        test_info = build_test_info(
-                            project_path,
-                            project_info,
-                            test_result
-                        )
 
                         # =============================================
                         # NO AI FIX EXISTS YET — this is the pre-fix
                         # (first-run) Docker check, so there is no
                         # checkpoint to roll back to and no 'fix' to
-                        # log. Just store the error, same as the
-                        # sibling "tests fail" branch above.
+                        # log. Just store the error and let the AI
+                        # take its first attempt.
                         # =============================================
 
                         print(
@@ -430,140 +562,1113 @@ while attempt < MAX_ATTEMPTS:
                             "on the next attempt."
                         )
 
-                        if attempt == MAX_ATTEMPTS:
-
-                            print(
-                                "\n❌ Maximum attempts reached."
-                            )
-
-                            break
-
                         continue
-                # ------------------------------------------------
-                # TESTS FAIL
-                # ------------------------------------------------
-
-                else:
-
-                    print("\n❌ TESTS FAILED")
 
 
-                    # =================================================
-                    # THIS IS THE IMPORTANT PART
-                    #
-                    # At this point there is NO newly applied fix.
-                    #
-                    # This can happen on the FIRST run.
-                    #
-                    # Therefore we DO NOT rollback here.
-                    #
-                    # We simply store the test failure and ask AI
-                    # for a fix.
-                    # =================================================
+        # ========================================================
+        # READ SOURCE FILES
+        # ========================================================
+
+        # ========================================================
+        # READ SOURCE FILES
+        # ========================================================
+
+        source_files = project_info.get(
+            "source_files",
+            []
+        )
 
 
-                    error = (
-                        "The application runs successfully, "
-                        "but the automated tests are failing.\n\n"
-
-                        "TEST OUTPUT:\n"
-                        + test_result["stdout"]
-
-                        + "\n\nTEST ERROR:\n"
-                        + test_result["stderr"]
-                    )
+        source_code = ""
 
 
-                    test_info = build_test_info(project_path, project_info, test_result)
+        for source_file in source_files:
+
+            file_path = os.path.join(
+                project_path,
+                source_file
+            )
 
 
-                    # Establish the real baseline failing-test count now,
-                    # before any AI fix has been proposed. Without this,
-                    # last_failed_count stays at infinity and the first
-                    # post-fix test-failure count always looks like
-                    # "progress" even when the fix made things worse.
-                    last_failed_count = count_failed_tests(test_result["stdout"])
+            source_code += f"""
+
+    ===== FILE: {source_file} =====
+
+    {read_file(file_path)}
+    """
 
 
-                    print("\n🔄 Test failure stored.")
+        # ========================================================
+        # FAILED FIX INFORMATION
+        # ========================================================
 
-                    print(
-                        "AI will analyze the test failure "
-                        "on the next attempt."
-                    )
-
-
-                    if attempt == MAX_ATTEMPTS:
-
-                        print(
-                            "\n❌ Maximum attempts reached."
-                        )
-
-                        break
+        failed_fix_info = ""
 
 
-                    continue
+        if state.failed_fixes:
+
+            failed_fix_info = """
+
+    PREVIOUS FAILED FIXES:
+
+    """
 
 
-            # ------------------------------------------------
-            # NO TEST FRAMEWORK
-            # ------------------------------------------------
+            for failed in state.failed_fixes[-3:]:
 
+                failed_fix_info += f"""
+
+    FILE:
+    {failed["file"]}
+
+    OLD:
+    {failed["old"]}
+
+    NEW:
+    {failed["new"]}
+
+    ERROR:
+    {failed["error"]}
+
+    ----------------------------------------
+    """
+         # ========================================================
+        # DEBUG: SHOW WHAT'S ACTUALLY BEING SENT TO THE A
+
+
+        # ========================================================
+        # CREATE PROMPT
+        # ========================================================
+
+        if debug_type in ("docker_build", "docker_runtime"):
+
+            print("\n===== DOCKER DEBUGGING MODE =====")
+
+            dockerfile_path = os.path.join(
+                project_path,
+                "Dockerfile"
+            )
+
+            if os.path.exists(dockerfile_path):
+                dockerfile_content = read_file(
+                    dockerfile_path
+                )
             else:
-
-                print("\n⚠️ No test framework detected.")
-
-                print("\n===== RUNNING DOCKER VALIDATION =====")
+                dockerfile_content = "Dockerfile does not exist."
 
 
-                docker_result = build_and_run_docker(
-                    project_path,
-                    entry_point=project_info["entry_point"],
-                    project_info=project_info
+            dockerignore_path = os.path.join(
+                project_path,
+                ".dockerignore"
+            )
+
+            if os.path.exists(dockerignore_path):
+                dockerignore_content = read_file(dockerignore_path)
+            else:
+                dockerignore_content = "No .dockerignore file exists."
+
+            # =====================================================
+            # GATE SOURCE CODE FOR BUILD FAILURES
+            # =====================================================
+            # A docker BUILD failure happens before the container ever
+            # runs, so application source code cannot be the cause
+            # UNLESS the build error text itself names a source file
+            # (e.g. a bad COPY path, missing file, etc).
+
+
+            if debug_type == "docker_build":
+                source_files_list = project_info.get("source_files", [])
+
+                mentions_source_file = any(
+                    os.path.basename(f) in state.error
+                    for f in source_files_list
+                )
+
+                if mentions_source_file:
+                    docker_source_code = source_code
+                else:
+                    docker_source_code = (
+                        "(omitted — this is a Docker BUILD failure and the "
+                        "build error does not reference any application "
+                        "source file. The problem is almost certainly in "
+                        "the Dockerfile itself, not the application code.)"
+                    )
+            else:
+                # docker_runtime failures can legitimately involve app code
+                docker_source_code = source_code
+
+            print("\n===== DEBUG: SOURCE CODE SENT TO DOCKER PROMPT =====")
+            print(docker_source_code)
+
+            print("\n===== DEBUG: DOCKERFILE SENT TO AI =====")
+            print(dockerfile_content)
+
+            print("\n===== DEBUG: DOCKERIGNORE SENT TO AI =====")
+            print(dockerignore_content)
+
+            prompt = docker_failure_prompt(
+                project_path,
+                app_file,
+                state.error,
+                docker_source_code,
+                dockerfile_content,
+                dockerignore_content,
+                project_info,
+                failed_fix_info=failed_fix_info
+            )
+            prompt = state.extra_instructions + prompt
+
+
+        elif state.test_info:
+
+            prompt = test_failure_prompt(
+                project_path,
+                app_file,
+                state.error,
+                source_code,
+                state.test_info,
+                project_info.get(
+                    "source_files",
+                    []
+                ),
+                failed_fix_info=failed_fix_info
+            )
+            prompt = state.extra_instructions + prompt
+
+        else:
+
+            error_type = classify_application_error(state.error)
+
+            missing_module = extract_missing_module(state.error)
+
+            print(
+                f"\n===== ERROR TYPE: {error_type} ====="
+            )
+
+            if missing_module:
+                print(
+                    f"===== MISSING MODULE: {missing_module} ====="
+                )
+
+            allowed_fix_files = get_allowed_fix_files(
+                error_type,
+                project_info
+            )
+
+            print(
+                f"===== ALLOWED FIX FILES: {allowed_fix_files} ====="
+            )
+
+            requirements_path = os.path.join(
+                project_path,
+                project_info.get("requirements_file") or "requirements.txt"
+            )
+
+            if os.path.exists(requirements_path):
+                requirements_content = read_file(requirements_path)
+            else:
+                requirements_content = ""
+            prompt = application_error_prompt(
+                project_path,
+                app_file,
+                state.error,
+                source_code,
+                project_info.get(
+                    "source_files",
+                    []
+                ),
+                requirements_content,
+                error_type=error_type,
+                allowed_fix_files=allowed_fix_files,
+                failed_fix_info=failed_fix_info
+            )
+            prompt = state.extra_instructions + prompt
+
+
+        # ========================================================
+        # SKIP AI FOR EXTERNAL INFRASTRUCTURE FAILURES
+        # ========================================================
+
+     
+        if debug_type == "docker_infrastructure":
+
+            print("\n⚠️ SKIPPING AI — EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
+            print(
+                "This appears to be a registry/network issue, not a "
+                "problem with the project. Retrying the same Dockerfile "
+                "unchanged, since these failures are often transient."
+            )
+
+            if state.attempt == MAX_ATTEMPTS:
+                print("\n❌ Maximum attempts reached. Giving up.")
+                break
+
+            state.error = ""
+            continue
+
+
+        # ========================================================
+        # ASK LLM FOR FIX
+        # ========================================================
+
+        print("\n===== ASKING AI FOR FIX =====")
+
+
+        try:
+
+            raw_response = llm_client.generate_fix(prompt)
+
+        except Exception as e:
+
+            print("\n❌ ERROR COMMUNICATING WITH AI")
+            print(e)
+
+            break
+
+
+        # ========================================================
+        # READ AI RESPONSE
+        # ========================================================
+
+        print("\n===== RAW AI RESPONSE =====")
+        print(raw_response)
+
+        # ========================================================
+        # PARSE JSON
+        # ========================================================
+
+        try:
+
+            fix = json.loads(raw_response)
+
+
+        except json.JSONDecodeError as e:
+
+            print("\n❌ AI returned invalid JSON")
+
+            print(e)
+
+
+            if state.attempt == MAX_ATTEMPTS:
+
+                print(
+                    "\n❌ Maximum attempts reached."
+                )
+
+                break
+
+
+            continue
+
+
+        # ========================================================
+        # CHECK REQUIRED FIELDS
+        # ========================================================
+
+        required_fields = [
+
+            "file",
+
+            "old",
+
+            "new",
+
+            "reason"
+
+        ]
+
+
+        missing = [
+
+            field
+
+            for field in required_fields
+
+            if field not in fix
+
+        ]
+
+
+        if missing:
+
+            print(
+                "\n❌ AI response missing fields:"
+            )
+
+            print(missing)
+
+            continue
+
+
+
+
+        # ========================================================
+        # HANDLE EXTERNAL DOCKER FAILURE
+        # ========================================================
+        if (
+            debug_type in ("docker_build", "docker_runtime")
+            and not fix["file"]
+        ):
+
+            print(
+                "\n⚠️ DOCKER FAILURE IS EXTERNAL"
+            )
+
+            print(
+                "\nREASON:"
+            )
+
+            print(
+                fix["reason"]
+            )
+
+            print(
+                "\nNo project file will be modified."
+            )
+
+            break
+
+
+        # ========================================================
+        # REJECT REPEATED FIX
+        # ========================================================
+
+        if is_repeated_fix(fix, state.failed_fixes):
+            sig = fix_signature(fix)
+            state.repeated_fix_counts[sig] = state.repeated_fix_counts.get(sig, 0) + 1
+            count = state.repeated_fix_counts[sig]
+
+            print(
+                f"\n❌ AI repeated a fix that already failed. (seen {count}x)"
+            )
+            print(f"FILE: {fix['file']}")
+            print(f"OLD: {fix['old']}")
+
+            if count >= 3:
+                print(
+                    "\n===== PIPELINE STUCK ====="
+                    "\nAI could not produce a distinct fix after "
+                    f"{count} identical attempts."
+                    "\nStopping — this needs a human to look at it."
+                )
+                break  # or return / raise, depending on your loop structure
+
+            print("🔄 Skipping validation. Asking AI for a different fix "
+                "with a stronger constraint...")
+
+            state.extra_instructions = f"""
+
+        ==================================================
+        REPEATED FIX OVERRIDE — READ THIS FIRST
+        ==================================================
+        Your previous answer was IDENTICAL to a fix that was already
+        tried and failed:
+
+        FILE: {fix["file"]}
+        OLD:  {fix["old"]}
+        NEW:  {fix["new"]}
+
+        You MUST NOT propose this exact change again.
+        Specifically, do NOT wrap values in str(), and do NOT use
+        string concatenation to "fix" this error. Consider whether
+        the correct fix is a numeric conversion (int()) instead, or
+        whether the bug is somewhere other than the operator itself.
+        """
+            continue  # loop back and rebuild the prompt with extra_instructions
+
+
+        # ========================================================
+        # NORMALIZE FILE PATH
+        # ========================================================
+
+        source_files = project_info.get(
+        "source_files",
+        []
+    )
+
+        allowed_files = list(source_files)
+
+        if os.path.exists(
+            os.path.join(project_path, "Dockerfile")
+        ):
+            allowed_files.append("Dockerfile")
+
+        if os.path.exists(
+            os.path.join(project_path, ".dockerignore")
+        ):
+            allowed_files.append(".dockerignore")
+
+        if project_info.get("requirements_file"):
+            allowed_files.append(project_info["requirements_file"])
+
+        # ========================================================
+        # ERROR-SPECIFIC FILE POLICY
+        # ========================================================
+
+        if debug_type == "application":
+
+            error_type = classify_application_error(state.error)
+
+            policy_allowed_files = get_allowed_fix_files(
+                error_type,
+                project_info
+            )
+
+            if policy_allowed_files:
+                allowed_files = policy_allowed_files
+
+
+        project_root = os.path.abspath(project_path)
+
+
+
+        raw_selected_file = fix["file"]
+
+        # --------------------------------------------------------
+        # Normalize slashes and strip any leading "./"
+        # --------------------------------------------------------
+
+        normalized = raw_selected_file.replace("\\", "/").strip()
+
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+
+        # --------------------------------------------------------
+        # If it's absolute, make it relative to the project root
+        # --------------------------------------------------------
+
+        if os.path.isabs(normalized):
+            normalized = os.path.relpath(normalized, project_root)
+            normalized = normalized.replace("\\", "/")
+
+        # --------------------------------------------------------
+        # Match against known source files by exact match OR suffix.
+        # This handles any junk prefix the model adds (project folder
+        # name, nested path, "src/", etc.) regardless of project layout.
+        # --------------------------------------------------------
+
+        selected_file = None
+
+        for candidate in allowed_files:
+
+            candidate_normalized = candidate.replace("\\", "/")
+
+            if normalized == candidate_normalized:
+                selected_file = candidate
+                break
+
+            if normalized.endswith("/" + candidate_normalized):
+                selected_file = candidate
+                break
+
+        # --------------------------------------------------------
+        # CHECK ALLOWED SOURCE FILE
+        # --------------------------------------------------------
+
+        if selected_file is None:
+
+            print(
+                "\n❌ AI proposed an invalid source file."
+            )
+
+            print(
+                "Allowed source files:"
+            )
+
+            print(allowed_files)
+
+            print(
+                "Received:"
+            )
+
+            print(fix["file"])
+
+            state.extra_instructions = (
+                "\n\nIMPORTANT CORRECTION: Your previous answer proposed "
+                f"modifying '{fix.get('file', '')}', but that file is not "
+                f"allowed for this type of error. The ONLY file you are "
+                f"permitted to modify right now is: {allowed_files}. "
+                "You MUST set \"file\" to one of the files in that list. "
+                "Do not propose any other file."
+            )
+
+            if state.attempt == MAX_ATTEMPTS:
+                print("\n❌ Maximum attempts reached.")
+                break
+
+            continue
+
+        fix["file"] = selected_file
+
+
+        # ========================================================
+        # HARD GATE: DOCKER BUILD FAILURES CANNOT BE FIXED
+        # BY MODIFYING APPLICATION SOURCE
+        # ========================================================
+
+        if (
+            debug_type == "docker_build"
+            and fix["file"] not in ("Dockerfile", "")
+        ):
+
+            print(
+                "\n⚠️ REJECTED: AI proposed modifying "
+                f"'{fix['file']}' for a Docker BUILD failure."
+            )
+
+            print(
+                "Build failures happen before the container runs, so "
+                "application source code cannot be responsible. "
+                "Re-prompting with a stricter instruction."
+            )
+
+            state.extra_instructions = (
+                "\n\nIMPORTANT CORRECTION: Your previous answer proposed "
+                f"modifying '{fix['file']}', but this is a Docker BUILD "
+                "failure — the container never ran, so application source "
+                "code cannot be the cause. You must either propose a change "
+                "to the Dockerfile, or return file=\"\" if this is an "
+                "external infrastructure issue."
+            )
+
+            if state.attempt == MAX_ATTEMPTS:
+                print("\n❌ Maximum attempts reached.")
+                break
+
+            continue
+
+        state.extra_instructions = ""
+
+
+
+        # ========================================================
+        # READ SELECTED FILE
+        # ========================================================
+
+        selected_file_path = os.path.join(
+
+            project_path,
+
+            fix["file"]
+
+        )
+
+
+        code = read_file(
+            selected_file_path
+        )
+
+
+        # ========================================================
+        # SHOW PROPOSED FIX
+        # ========================================================
+
+        print("\n===== PROPOSED FIX =====")
+
+
+        print("\nFILE:")
+
+        print(fix["file"])
+
+
+        print("\nOLD:")
+
+        print(fix["old"])
+
+
+        print("\nNEW:")
+
+        print(fix["new"])
+
+
+        print("\nREASON:")
+
+        print(fix["reason"])
+
+
+       # ========================================================
+        # VALIDATE FIX
+        # ========================================================
+
+        print("\n===== VALIDATING FIX =====")
+
+
+        if fix["file"] == "Dockerfile":
+
+            validation = validate_dockerfile_fix(
+                code,
+                fix["old"],
+                fix["new"]
+            )
+
+        elif fix["file"] == ".dockerignore":
+
+            validation = validate_dockerignore_fix(
+                code,
+                fix["old"],
+                fix["new"]
+            )
+
+        elif fix["file"] == "requirements.txt":
+
+            validation = validate_requirements_fix(
+                requirements_content,
+                fix["old"],
+                fix["new"]
+            )
+
+        else:
+
+            validation = validate_python_fix(
+                code,
+                fix["old"],
+                fix["new"]
+            )
+
+
+        if not validation["valid"]:
+            print("\n❌ FIX REJECTED")
+            print("REASON:")
+            print(validation["reason"])
+
+            print("\n===== IMPORTANT: CURRENT FILE CONTENT =====")
+
+            if fix["file"] == "requirements.txt":
+                print(requirements_content)
+            else:
+                print(code)
+
+            print("\nThe next AI response MUST choose 'old' from the source above.")
+
+            # Record this so the AI sees it on the next prompt
+            # instead of repeating the same mistake blind.
+            state.failed_fixes.append({
+                "file": fix.get("file", ""),
+                "old": fix.get("old", ""),
+                "new": fix.get("new", ""),
+                "error": (
+                    "VALIDATION REJECTED THIS AI RESPONSE. "
+                    "The proposed OLD value does not exist in the CURRENT SOURCE CODE. "
+                    "On the next attempt, inspect CURRENT SOURCE CODE again and copy "
+                    "the OLD value character-for-character from it. "
+                    f"Validator reason: {validation['reason']}"
+                )
+            })
+
+            if state.attempt == MAX_ATTEMPTS:
+                print(
+                    "\n❌ Maximum attempts reached."
+                )
+                break
+
+            print(
+                "\n🔄 Invalid fix. Asking AI for another fix..."
+            )
+            continue
+
+
+        print("\n✅ FIX VALIDATION PASSED")
+
+        print(validation["reason"])
+
+
+        # ========================================================
+        # HUMAN APPROVAL
+        # ========================================================
+
+        choice = input(
+            "\nApply this fix? [y/n]: "
+        )
+
+
+        if choice.lower() != "y":
+
+            print(
+                "\n❌ Fix rejected by human."
+            )
+
+            break
+
+
+        # ========================================================
+        # CREATE GIT CHECKPOINT
+        # ========================================================
+
+        print(
+            "\n===== CREATING GIT CHECKPOINT ====="
+        )
+
+
+        checkpoint = git_checkpoint(project_path)
+
+        if not checkpoint["success"]:
+            print("❌ Could not create Git checkpoint.")
+            break
+
+        checkpoint_commit = checkpoint["checkpoint"]
+
+        print(
+            "✅ Git checkpoint created."
+        )
+
+
+        # ========================================================
+        # MODIFY FILE
+        # ========================================================
+
+        result = modify_file(
+
+            selected_file_path,
+
+            validation["resolved_old"],
+
+            fix["new"]
+
+        )
+
+
+
+
+        print("\n" + result)
+
+
+        if result != "CHANGE APPLIED successfully.":
+
+            print(
+                "\n❌ Fix could not be applied."
+            )
+
+            break
+
+
+        # ========================================================
+        # VERIFY APPLICATION
+        # ========================================================
+
+        print(
+            "\n===== VERIFYING FIX ====="
+        )
+
+        if fix["file"] == "requirements.txt":
+            print(
+                "\n===== INSTALLING UPDATED DEPENDENCIES ====="
+            )
+            requirements_path_for_install = os.path.join(
+                project_path,
+                project_info.get("requirements_file") or "requirements.txt"
+            )
+
+            pip_install_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "-r",
+                    requirements_path_for_install
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            print(pip_install_result.stdout)
+
+            if pip_install_result.returncode != 0:
+                print(
+                    "\n⚠️ pip install failed:"
+                )
+                print(pip_install_result.stderr)
+            else:
+                print(
+                    "✅ Dependencies installed successfully."
+                )
+
+    
+
+
+        verify = run_project(
+            project_info
+        )
+
+
+        # ========================================================
+        # APPLICATION STILL FAILS
+        # ========================================================
+
+        if verify["returncode"] != 0:
+
+            print(
+                "\n❌ APPLICATION STILL FAILS"
+            )
+
+
+            print("\nNEW ERROR:")
+
+            print(
+                verify["stderr"]
+            )
+
+
+            # ----------------------------------------------------
+            # CHECK IF THIS FIX MADE PROGRESS
+            # (new error is DIFFERENT from the error that existed
+            # before this fix was applied)
+            # ----------------------------------------------------
+
+            made_progress = (verify["stderr"] != state.last_error)
+
+
+            if made_progress:
+
+                # ------------------------------------------------
+                # KEEP THE FIX — it changed the error, that's
+                # forward progress even though it's not fully fixed.
+                # ------------------------------------------------
+
+                print(
+                    "\n✅ Progress made — new error is different. "
+                    "Keeping this fix."
+                )
+
+                state.error = verify["stderr"]
+
+                state.last_error = verify["stderr"]
+
+                state.test_info = ""
+
+                state.attempt = 0
+
+                continue
+
+
+            # ----------------------------------------------------
+            # NO PROGRESS — roll back
+            # ----------------------------------------------------
+
+            # Only NOW is this a genuine failed fix — log it so the
+            # AI knows not to propose it again. Fixes that were kept
+            # (made_progress == True, above) must NOT be logged here,
+            # or PREVIOUS FAILED FIXES ends up full of stale old/new
+            # pairs referencing code that no longer exists in the
+            # file, which the model can hallucinate-blend together.
+            state.failed_fixes.append({
+                "file": fix["file"],
+                "old": fix["old"],
+                "new": fix["new"],
+                "error": verify["stderr"]
+            })
+
+            print(
+                "\n===== ROLLING BACK FAILED FIX (no progress) ====="
+            )
+
+            rollback = git_rollback(
+                project_path,
+                checkpoint_commit
+            )
+
+            if not rollback["success"]:
+
+                print(
+                    "\n❌ Git rollback failed."
+                )
+
+                print(
+                    rollback["stderr"]
+                )
+
+                break
+
+            print(
+                "✅ Failed fix rolled back."
+            )
+
+            state.error = verify["stderr"]
+
+            state.last_error = verify["stderr"]
+
+            state.test_info = ""
+
+            continue
+
+
+        # ========================================================
+        # APPLICATION SUCCESS
+        # ========================================================
+
+        print(
+            "\n✅ APPLICATION RUNS"
+        )
+
+
+        print(
+            "\nAPPLICATION OUTPUT:"
+        )
+
+
+        print(
+            verify["stdout"]
+        )
+
+
+        # ========================================================
+        # RUN TESTS AFTER FIX
+        # ========================================================
+
+        if project_info.get("test_framework"):
+
+            print(
+                "\n===== RUNNING TESTS ====="
+            )
+
+
+            test_result = run_tests(
+                project_path
+            )
+
+
+            print(
+                "\n===== TEST OUTPUT ====="
+            )
+
+
+            print(
+                test_result["stdout"]
+            )
+
+
+            if test_result["stderr"]:
+
+                print(
+                    "\n===== TEST ERROR ====="
+                )
+
+                print(
+                    test_result["stderr"]
                 )
 
 
-                print("\n===== DOCKER BUILD STDOUT =====")
-                print(docker_result["build_stdout"])
+            print(
+                "\n===== TEST RETURN CODE ====="
+            )
 
 
-                print("\n===== DOCKER BUILD STDERR =====")
-                print(docker_result["build_stderr"])
+            print(
+                test_result["returncode"]
+            )
 
 
-                print("\n===== DOCKER BUILD RETURN CODE =====")
-                print(docker_result["build_returncode"])
+            # ====================================================
+            # TESTS PASS
+            # ====================================================
+
+            if test_result["returncode"] == 0:
+
+                print(
+                    "\n✅ ALL TESTS PASSED"
+                )
 
 
-                print("\n===== DOCKER CONTAINER STDOUT =====")
-                print(docker_result["run_stdout"])
+                # =================================================
+                # DOCKER VALIDATION
+                # =================================================
+
+                print(
+                    "\n===== RUNNING DOCKER VALIDATION ====="
+                )
 
 
-                print("\n===== DOCKER CONTAINER STDERR =====")
-                print(docker_result["run_stderr"])
+                docker_result, debug_type = validate_docker(
+                    project_path,
+                    project_info
+                )
 
 
-                print("\n===== DOCKER CONTAINER RETURN CODE =====")
-                print(docker_result["run_returncode"])
+                print(
+                    "\n===== DOCKER BUILD STDOUT ====="
+                )
 
+
+                print(
+                    docker_result["build_stdout"]
+                )
+
+
+                print(
+                    "\n===== DOCKER BUILD STDERR ====="
+                )
+
+
+                print(
+                    docker_result["build_stderr"]
+                )
+
+
+                print(
+                    "\n===== DOCKER BUILD RETURN CODE ====="
+                )
+
+
+                print(
+                    docker_result["build_returncode"]
+                )
+
+
+                print(
+                    "\n===== DOCKER CONTAINER STDOUT ====="
+                )
+
+
+                print(
+                    docker_result["run_stdout"]
+                )
+
+
+                print(
+                    "\n===== DOCKER CONTAINER STDERR ====="
+                )
+
+
+                print(
+                    docker_result["run_stderr"]
+                )
+
+
+                print(
+                    "\n===== DOCKER CONTAINER RETURN CODE ====="
+                )
+
+
+                print(
+                    docker_result["run_returncode"]
+                )
+
+
+                # =================================================
+                # DOCKER PASSED
+                # =================================================
 
                 if (
                     docker_result["build_returncode"] == 0
                     and docker_result["run_returncode"] == 0
                 ):
 
-                    print("\n✅ DOCKER VALIDATION PASSED")
+                    print(
+                        "\n✅ DOCKER VALIDATION PASSED"
+                    )
 
+
+                    # =============================================
+                    # COMMIT
+                    # =============================================
 
                     print(
                         "\n===== COMMITTING SUCCESSFUL FIX ====="
                     )
 
-
                     commit_result = git_commit_success(
                         project_path
                     )
-
 
                     if not commit_result["success"]:
 
@@ -571,65 +1676,128 @@ while attempt < MAX_ATTEMPTS:
                             "\n❌ Could not commit successful fix."
                         )
 
-                        print(commit_result["stderr"])
+                        print(
+                            commit_result["stderr"]
+                        )
 
                         break
 
+                    print(
+                        "✅ Successful fix committed."
+                    )
 
-                    print("✅ Successful fix committed.")
-
-                    print("\n🎉 PROJECT SUCCESSFUL")
+                    print(
+                        "\n🎉 FIX SUCCESSFUL"
+                    )
 
                     break
 
 
+                # =================================================
+                # DOCKER FAILED
+                # =================================================
+
                 else:
 
-                    print("\n❌ DOCKER VALIDATION FAILED")
+                    print(
+                        "\n❌ DOCKER VALIDATION FAILED"
+                    )
 
-                    if docker_result["build_returncode"] != 0:
-                        debug_type = "docker_build"
-                    else:
-                        debug_type = "docker_runtime"
+                    state.stored_debug_type = debug_type
 
-                    stored_debug_type = debug_type
-                    
-                    print(f"\n===== DEBUG: CLASSIFIED FAILURE AS: {debug_type} =====")
-
-                    if is_docker_infrastructure_error(docker_result):
-                            print("\n⚠️ DETECTED EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
-                            print("This looks like a registry/network issue, not a project problem.")
-                            debug_type = "docker_infrastructure"
-                            stored_debug_type = debug_type
-
-        
-
-
-                    error = (
-                        "The application passed locally, "
-                        "but failed inside Docker.\n\n"
-
-                        "DOCKER BUILD STDOUT:\n"
-                        + docker_result["build_stdout"]
-
-                        + "\n\nDOCKER BUILD STDERR:\n"
-                        + docker_result["build_stderr"]
-
-                        + "\n\nDOCKER CONTAINER STDOUT:\n"
-                        + docker_result["run_stdout"]
-
-                        + "\n\nDOCKER CONTAINER STDERR:\n"
-                        + docker_result["run_stderr"]
+                    print(
+                        f"\n===== DEBUG: CLASSIFIED FAILURE AS: "
+                        f"{debug_type} ====="
                     )
 
 
+
+                    state.error = (
+
+                        "The application and local tests passed, "
+
+                        "but the application failed inside Docker.\n\n"
+
+                        "DOCKER BUILD STDOUT:\n"
+
+                        + docker_result["build_stdout"]
+
+                        + "\n\nDOCKER BUILD STDERR:\n"
+
+                        + docker_result["build_stderr"]
+
+                        + "\n\nDOCKER CONTAINER STDOUT:\n"
+
+                        + docker_result["run_stdout"]
+
+                        + "\n\nDOCKER CONTAINER STDERR:\n"
+
+                        + docker_result["run_stderr"]
+
+                    )
+
+
+                    state.test_info = build_test_info(
+                        project_path,
+                        project_info,
+                        test_result
+                    )
+
+
+                    state.failed_fixes.append({
+
+                        "file": fix["file"],
+
+                        "old": fix["old"],
+
+                        "new": fix["new"],
+
+                        "error": state.error
+
+                    })
+
+
                     # =============================================
-                    # NO AI FIX EXISTS YET — this is the pre-fix
-                    # (first-run) Docker check, so there is no
-                    # checkpoint to roll back to and no 'fix' to
-                    # log. Just store the error and let the AI
-                    # take its first attempt.
+                    # ROLLBACK
                     # =============================================
+
+                    print(
+                        "\n===== ROLLING BACK DOCKER FAILED FIX ====="
+                    )
+
+
+                    rollback = git_rollback(
+                        project_path,
+                        checkpoint_commit
+                    )
+
+
+                    if not rollback["success"]:
+
+                        print(
+                            "\n❌ Git rollback failed."
+                        )
+
+                        print(
+                            rollback["stderr"]
+                        )
+
+                        break
+
+
+                    print(
+                        "✅ Docker failed fix rolled back."
+                    )
+
+
+                    if state.attempt == MAX_ATTEMPTS:
+
+                        print(
+                            "\n❌ Maximum attempts reached."
+                        )
+
+                        break
+
 
                     print(
                         "\n🔄 Docker failure stored."
@@ -640,1061 +1808,175 @@ while attempt < MAX_ATTEMPTS:
                         "on the next attempt."
                     )
 
+
                     continue
 
 
-    # ========================================================
-    # READ SOURCE FILES
-    # ========================================================
+            # ====================================================
+            # TESTS FAILED AFTER FIX
+            # ====================================================
 
-    # ========================================================
-    # READ SOURCE FILES
-    # ========================================================
-
-    source_files = project_info.get(
-        "source_files",
-        []
-    )
-
-
-    source_code = ""
-
-
-    for source_file in source_files:
-
-        file_path = os.path.join(
-            project_path,
-            source_file
-        )
-
-
-        source_code += f"""
-
-===== FILE: {source_file} =====
-
-{read_file(file_path)}
-"""
-
-
-    # ========================================================
-    # FAILED FIX INFORMATION
-    # ========================================================
-
-    failed_fix_info = ""
-
-
-    if failed_fixes:
-
-        failed_fix_info = """
-
-PREVIOUS FAILED FIXES:
-
-"""
-
-
-        for failed in failed_fixes[-3:]:
-
-            failed_fix_info += f"""
-
-FILE:
-{failed["file"]}
-
-OLD:
-{failed["old"]}
-
-NEW:
-{failed["new"]}
-
-ERROR:
-{failed["error"]}
-
-----------------------------------------
-"""
-     # ========================================================
-    # DEBUG: SHOW WHAT'S ACTUALLY BEING SENT TO THE A
-
-
-    # ========================================================
-    # CREATE PROMPT
-    # ========================================================
-
-    if debug_type in ("docker_build", "docker_runtime"):
-
-        print("\n===== DOCKER DEBUGGING MODE =====")
-
-        dockerfile_path = os.path.join(
-            project_path,
-            "Dockerfile"
-        )
-
-        if os.path.exists(dockerfile_path):
-            dockerfile_content = read_file(
-                dockerfile_path
-            )
-        else:
-            dockerfile_content = "Dockerfile does not exist."
-
-
-        dockerignore_path = os.path.join(
-            project_path,
-            ".dockerignore"
-        )
-
-        if os.path.exists(dockerignore_path):
-            dockerignore_content = read_file(dockerignore_path)
-        else:
-            dockerignore_content = "No .dockerignore file exists."
-
-        # =====================================================
-        # GATE SOURCE CODE FOR BUILD FAILURES
-        # =====================================================
-        # A docker BUILD failure happens before the container ever
-        # runs, so application source code cannot be the cause
-        # UNLESS the build error text itself names a source file
-        # (e.g. a bad COPY path, missing file, etc).
-
-
-        if debug_type == "docker_build":
-            source_files_list = project_info.get("source_files", [])
-
-            mentions_source_file = any(
-                os.path.basename(f) in error
-                for f in source_files_list
-            )
-
-            if mentions_source_file:
-                docker_source_code = source_code
             else:
-                docker_source_code = (
-                    "(omitted — this is a Docker BUILD failure and the "
-                    "build error does not reference any application "
-                    "source file. The problem is almost certainly in "
-                    "the Dockerfile itself, not the application code.)"
+
+                print(
+                    "\n❌ TESTS FAILED"
                 )
+
+
+                current_failed_count = count_failed_tests(
+                    test_result["stdout"]
+                )
+
+
+                made_progress = current_failed_count < state.last_failed_count
+
+
+                if made_progress:
+
+                    # ----------------------------------------------
+                    # KEEP THE FIX — fewer tests are failing now.
+                    # ----------------------------------------------
+
+                    print(
+                        f"\n✅ Progress made — failed test count "
+                        f"dropped from {state.last_failed_count} to "
+                        f"{current_failed_count}. Keeping this fix."
+                    )
+
+                    state.last_failed_count = current_failed_count
+
+                    state.attempt = 0
+
+                else:
+
+                    # ----------------------------------------------
+                    # ROLLBACK — no improvement, or it got worse.
+                    #
+                    # Only NOW is this a genuine failed fix — log it
+                    # so the AI knows not to propose it again. Fixes
+                    # that were kept (made_progress == True, above)
+                    # must NOT be logged here, or PREVIOUS FAILED
+                    # FIXES ends up full of stale old/new pairs
+                    # referencing code that no longer exists in the
+                    # file, which the model can hallucinate-blend
+                    # together into fabricated "old" text.
+                    # ----------------------------------------------
+
+                    state.failed_fixes.append({
+
+                        "file": fix["file"],
+
+                        "old": fix["old"],
+
+                        "new": fix["new"],
+
+                        "error": (
+                            test_result["stdout"]
+                            + "\n"
+                            + test_result["stderr"]
+                        )
+
+                    })
+
+                    print(
+                        "\n===== ROLLING BACK FAILED FIX "
+                        "(no test progress) ====="
+                    )
+
+                    rollback = git_rollback(
+                        project_path,
+                        checkpoint_commit
+                    )
+
+                    if not rollback["success"]:
+
+                        print(
+                            "\n❌ Git rollback failed."
+                        )
+
+                        print(
+                            rollback["stderr"]
+                        )
+
+                        break
+
+                    print(
+                        "✅ Failed fix rolled back."
+                    )
+
+
+                # ------------------------------------------------
+                # STORE TEST ERROR
+                # ------------------------------------------------
+
+                state.error = (
+
+                    "The application runs successfully, "
+
+                    "but the automated tests are failing.\n\n"
+
+                    "TEST OUTPUT:\n"
+
+                    + test_result["stdout"]
+
+                    + "\n\nTEST ERROR:\n"
+
+                    + test_result["stderr"]
+
+                )
+
+
+                state.test_info = build_test_info(
+                    project_path,
+                    project_info,
+                    test_result
+                )
+
+
+                print(
+                    "🔄 Test failure stored."
+                )
+
+                print(
+                    "AI will analyze the test failure again."
+                )
+
+
+                if state.attempt == MAX_ATTEMPTS:
+
+                    print(
+                        "\n❌ Maximum attempts reached."
+                    )
+
+                    break
+
+
+                continue
+
+
+        # ========================================================
+        # NO TEST FRAMEWORK AFTER FIX
+        # ========================================================
+
         else:
-            # docker_runtime failures can legitimately involve app code
-            docker_source_code = source_code
-
-        print("\n===== DEBUG: SOURCE CODE SENT TO DOCKER PROMPT =====")
-        print(docker_source_code)
-
-        prompt = docker_failure_prompt(
-            project_path,
-            app_file,
-            error,
-            docker_source_code,
-            dockerfile_content,
-            dockerignore_content,
-            project_info,
-            failed_fix_info=failed_fix_info
-        )+ extra_instructions
-
-
-    elif test_info:
-
-        prompt = test_failure_prompt(
-            project_path,
-            app_file,
-            error,
-            source_code,
-            test_info,
-            project_info.get(
-                "source_files",
-                []
-            ),
-            failed_fix_info=failed_fix_info
-        )
-
-    else:
-
-        error_type = classify_application_error(error)
-
-        missing_module = extract_missing_module(error)
-
-        print(
-            f"\n===== ERROR TYPE: {error_type} ====="
-        )
-
-        if missing_module:
-            print(
-                f"===== MISSING MODULE: {missing_module} ====="
-            )
-
-        allowed_fix_files = get_allowed_fix_files(
-            error_type,
-            project_info
-        )
-
-        print(
-            f"===== ALLOWED FIX FILES: {allowed_fix_files} ====="
-        )
-
-        requirements_path = os.path.join(
-            project_path,
-            project_info.get("requirements_file") or "requirements.txt"
-        )
-
-        if os.path.exists(requirements_path):
-            requirements_content = read_file(requirements_path)
-        else:
-            requirements_content = ""
-        prompt = application_error_prompt(
-            project_path,
-            app_file,
-            error,
-            source_code,
-            project_info.get(
-                "source_files",
-                []
-            ),
-            requirements_content,
-            error_type=error_type,
-            allowed_fix_files=allowed_fix_files,
-            failed_fix_info=failed_fix_info
-        )+extra_instructions
-
-
-    # ========================================================
-    # SKIP AI FOR EXTERNAL INFRASTRUCTURE FAILURES
-    # ========================================================
-
-     
-    if debug_type == "docker_infrastructure":
-
-        print("\n⚠️ SKIPPING AI — EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
-        print(
-            "This appears to be a registry/network issue, not a "
-            "problem with the project. Retrying the same Dockerfile "
-            "unchanged, since these failures are often transient."
-        )
-
-        if attempt == MAX_ATTEMPTS:
-            print("\n❌ Maximum attempts reached. Giving up.")
-            break
-
-        error = ""
-        continue
-
-
-    # ========================================================
-    # ASK LLM FOR FIX
-    # ========================================================
-
-    print("\n===== ASKING AI FOR FIX =====")
-
-
-    try:
-
-        response = ollama.chat(
-
-            model="qwen2.5-coder:3b",
-
-            format={
-
-                "type": "object",
-
-                "properties": {
-
-                    "file": {
-                        "type": "string"
-                    },
-
-                    "old": {
-                        "type": "string"
-                    },
-
-                    "new": {
-                        "type": "string"
-                    },
-
-                    "reason": {
-                        "type": "string"
-                    }
-
-                },
-
-                "required": [
-
-                    "file",
-
-                    "old",
-
-                    "new",
-
-                    "reason"
-
-                ]
-
-            },
-
-            messages=[
-
-                {
-
-                    "role": "user",
-
-                    "content": prompt
-
-                }
-
-            ]
-
-        )
-
-
-    except Exception as e:
-
-        print("\n❌ ERROR COMMUNICATING WITH AI")
-
-        print(e)
-
-        break
-
-
-    # ========================================================
-    # READ AI RESPONSE
-    # ========================================================
-
-    print("\n===== RAW AI RESPONSE =====")
-
-    print(response.message.content)
-
-
-    # ========================================================
-    # PARSE JSON
-    # ========================================================
-
-    try:
-
-        fix = json.loads(
-            response.message.content
-        )
-
-
-    except json.JSONDecodeError as e:
-
-        print("\n❌ AI returned invalid JSON")
-
-        print(e)
-
-
-        if attempt == MAX_ATTEMPTS:
 
             print(
-                "\n❌ Maximum attempts reached."
-            )
-
-            break
-
-
-        continue
-
-
-    # ========================================================
-    # CHECK REQUIRED FIELDS
-    # ========================================================
-
-    required_fields = [
-
-        "file",
-
-        "old",
-
-        "new",
-
-        "reason"
-
-    ]
-
-
-    missing = [
-
-        field
-
-        for field in required_fields
-
-        if field not in fix
-
-    ]
-
-
-    if missing:
-
-        print(
-            "\n❌ AI response missing fields:"
-        )
-
-        print(missing)
-
-        continue
-
-
-
-
-    # ========================================================
-    # HANDLE EXTERNAL DOCKER FAILURE
-    # ========================================================
-    if (
-        debug_type in ("docker_build", "docker_runtime")
-        and not fix["file"]
-    ):
-
-        print(
-            "\n⚠️ DOCKER FAILURE IS EXTERNAL"
-        )
-
-        print(
-            "\nREASON:"
-        )
-
-        print(
-            fix["reason"]
-        )
-
-        print(
-            "\nNo project file will be modified."
-        )
-
-        break
-
-
-    # ========================================================
-    # REJECT REPEATED FIX
-    # ========================================================
-
-    if is_repeated_fix(fix, failed_fixes):
-
-        print("\n❌ AI repeated a fix that already failed.")
-        print("FILE:", fix["file"])
-        print("OLD:", fix["old"])
-
-        repeat_count = len([
-            f for f in failed_fixes
-            if f["old"] == fix["old"]
-        ])
-
-        failed_fixes.append({
-            "file": fix["file"],
-            "old": fix["old"],
-            "new": fix["new"],
-            "error": (
-                f"REPEATED {repeat_count} TIME(S) — DO NOT PROPOSE "
-                f"THIS SAME OLD/NEW PAIR AGAIN. Look closely at the "
-                f"actual error and propose a structurally different fix."
-            )
-        })
-
-        if attempt == MAX_ATTEMPTS:
-            print("\n❌ Maximum attempts reached.")
-            break
-
-        print("\n🔄 Skipping validation. Asking AI for a different fix...")
-        continue
-
-
-    # ========================================================
-    # NORMALIZE FILE PATH
-    # ========================================================
-
-    source_files = project_info.get(
-    "source_files",
-    []
-)
-
-    allowed_files = list(source_files)
-
-    if os.path.exists(
-        os.path.join(project_path, "Dockerfile")
-    ):
-        allowed_files.append("Dockerfile")
-
-    if os.path.exists(
-        os.path.join(project_path, ".dockerignore")
-    ):
-        allowed_files.append(".dockerignore")
-
-    if project_info.get("requirements_file"):
-        allowed_files.append(project_info["requirements_file"])
-
-    # ========================================================
-    # ERROR-SPECIFIC FILE POLICY
-    # ========================================================
-
-    if debug_type == "application":
-
-        policy_allowed_files = get_allowed_fix_files(
-            error_type,
-            project_info
-        )
-
-        if policy_allowed_files:
-            allowed_files = policy_allowed_files
-
-
-    project_root = os.path.abspath(project_path)
-
-
-
-    raw_selected_file = fix["file"]
-
-    # --------------------------------------------------------
-    # Normalize slashes and strip any leading "./"
-    # --------------------------------------------------------
-
-    normalized = raw_selected_file.replace("\\", "/").strip()
-
-    if normalized.startswith("./"):
-        normalized = normalized[2:]
-
-    # --------------------------------------------------------
-    # If it's absolute, make it relative to the project root
-    # --------------------------------------------------------
-
-    if os.path.isabs(normalized):
-        normalized = os.path.relpath(normalized, project_root)
-        normalized = normalized.replace("\\", "/")
-
-    # --------------------------------------------------------
-    # Match against known source files by exact match OR suffix.
-    # This handles any junk prefix the model adds (project folder
-    # name, nested path, "src/", etc.) regardless of project layout.
-    # --------------------------------------------------------
-
-    selected_file = None
-
-    for candidate in allowed_files:
-
-        candidate_normalized = candidate.replace("\\", "/")
-
-        if normalized == candidate_normalized:
-            selected_file = candidate
-            break
-
-        if normalized.endswith("/" + candidate_normalized):
-            selected_file = candidate
-            break
-
-    # --------------------------------------------------------
-    # CHECK ALLOWED SOURCE FILE
-    # --------------------------------------------------------
-
-    if selected_file is None:
-
-        print(
-            "\n❌ AI proposed an invalid source file."
-        )
-
-        print(
-            "Allowed source files:"
-        )
-
-        print(allowed_files)
-
-        print(
-            "Received:"
-        )
-
-        print(fix["file"])
-
-        extra_instructions = (
-            "\n\nIMPORTANT CORRECTION: Your previous answer proposed "
-            f"modifying '{fix.get('file', '')}', but that file is not "
-            f"allowed for this type of error. The ONLY file you are "
-            f"permitted to modify right now is: {allowed_files}. "
-            "You MUST set \"file\" to one of the files in that list. "
-            "Do not propose any other file."
-        )
-
-        if attempt == MAX_ATTEMPTS:
-            print("\n❌ Maximum attempts reached.")
-            break
-
-        continue
-
-    fix["file"] = selected_file
-
-
-    # ========================================================
-    # HARD GATE: DOCKER BUILD FAILURES CANNOT BE FIXED
-    # BY MODIFYING APPLICATION SOURCE
-    # ========================================================
-
-    if (
-        debug_type == "docker_build"
-        and fix["file"] not in ("Dockerfile", "")
-    ):
-
-        print(
-            "\n⚠️ REJECTED: AI proposed modifying "
-            f"'{fix['file']}' for a Docker BUILD failure."
-        )
-
-        print(
-            "Build failures happen before the container runs, so "
-            "application source code cannot be responsible. "
-            "Re-prompting with a stricter instruction."
-        )
-
-        extra_instructions = (
-            "\n\nIMPORTANT CORRECTION: Your previous answer proposed "
-            f"modifying '{fix['file']}', but this is a Docker BUILD "
-            "failure — the container never ran, so application source "
-            "code cannot be the cause. You must either propose a change "
-            "to the Dockerfile, or return file=\"\" if this is an "
-            "external infrastructure issue."
-        )
-
-        if attempt == MAX_ATTEMPTS:
-            print("\n❌ Maximum attempts reached.")
-            break
-
-        continue
-
-    extra_instructions = ""
-
-
-
-    # ========================================================
-    # READ SELECTED FILE
-    # ========================================================
-
-    selected_file_path = os.path.join(
-
-        project_path,
-
-        fix["file"]
-
-    )
-
-
-    code = read_file(
-        selected_file_path
-    )
-
-
-    # ========================================================
-    # SHOW PROPOSED FIX
-    # ========================================================
-
-    print("\n===== PROPOSED FIX =====")
-
-
-    print("\nFILE:")
-
-    print(fix["file"])
-
-
-    print("\nOLD:")
-
-    print(fix["old"])
-
-
-    print("\nNEW:")
-
-    print(fix["new"])
-
-
-    print("\nREASON:")
-
-    print(fix["reason"])
-
-
-   # ========================================================
-    # VALIDATE FIX
-    # ========================================================
-
-    print("\n===== VALIDATING FIX =====")
-
-
-    if fix["file"] == "Dockerfile":
-
-        validation = validate_dockerfile_fix(
-            code,
-            fix["old"],
-            fix["new"]
-        )
-
-    elif fix["file"] == ".dockerignore":
-
-        validation = validate_dockerignore_fix(
-            code,
-            fix["old"],
-            fix["new"]
-        )
-
-    elif fix["file"] == "requirements.txt":
-
-        validation = validate_requirements_fix(
-            requirements_content,
-            fix["old"],
-            fix["new"]
-        )
-
-    else:
-
-        validation = validate_python_fix(
-            code,
-            fix["old"],
-            fix["new"]
-        )
-
-
-    if not validation["valid"]:
-        print("\n❌ FIX REJECTED")
-        print("REASON:")
-        print(validation["reason"])
-
-        print("\n===== IMPORTANT: CURRENT FILE CONTENT =====")
-
-        if fix["file"] == "requirements.txt":
-            print(requirements_content)
-        else:
-            print(code)
-
-        print("\nThe next AI response MUST choose 'old' from the source above.")
-
-        # Record this so the AI sees it on the next prompt
-        # instead of repeating the same mistake blind.
-        failed_fixes.append({
-            "file": fix.get("file", ""),
-            "old": fix.get("old", ""),
-            "new": fix.get("new", ""),
-            "error": (
-                "VALIDATION REJECTED THIS AI RESPONSE. "
-                "The proposed OLD value does not exist in the CURRENT SOURCE CODE. "
-                "On the next attempt, inspect CURRENT SOURCE CODE again and copy "
-                "the OLD value character-for-character from it. "
-                f"Validator reason: {validation['reason']}"
-            )
-        })
-
-        if attempt == MAX_ATTEMPTS:
-            print(
-                "\n❌ Maximum attempts reached."
-            )
-            break
-
-        print(
-            "\n🔄 Invalid fix. Asking AI for another fix..."
-        )
-        continue
-
-
-    print("\n✅ FIX VALIDATION PASSED")
-
-    print(validation["reason"])
-
-
-    # ========================================================
-    # HUMAN APPROVAL
-    # ========================================================
-
-    choice = input(
-        "\nApply this fix? [y/n]: "
-    )
-
-
-    if choice.lower() != "y":
-
-        print(
-            "\n❌ Fix rejected by human."
-        )
-
-        break
-
-
-    # ========================================================
-    # CREATE GIT CHECKPOINT
-    # ========================================================
-
-    print(
-        "\n===== CREATING GIT CHECKPOINT ====="
-    )
-
-
-    checkpoint = git_checkpoint(project_path)
-
-    if not checkpoint["success"]:
-        print("❌ Could not create Git checkpoint.")
-        break
-
-    checkpoint_commit = checkpoint["checkpoint"]
-
-    print(
-        "✅ Git checkpoint created."
-    )
-
-
-    # ========================================================
-    # MODIFY FILE
-    # ========================================================
-
-    result = modify_file(
-
-        selected_file_path,
-
-        validation["resolved_old"],
-
-        fix["new"]
-
-    )
-
-
-
-
-    print("\n" + result)
-
-
-    if result != "CHANGE APPLIED successfully.":
-
-        print(
-            "\n❌ Fix could not be applied."
-        )
-
-        break
-
-
-    # ========================================================
-    # VERIFY APPLICATION
-    # ========================================================
-
-    print(
-        "\n===== VERIFYING FIX ====="
-    )
-
-    if fix["file"] == "requirements.txt":
-        print(
-            "\n===== INSTALLING UPDATED DEPENDENCIES ====="
-        )
-        requirements_path_for_install = os.path.join(
-            project_path,
-            project_info.get("requirements_file") or "requirements.txt"
-        )
-
-        pip_install_result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "-r",
-                requirements_path_for_install
-            ],
-            capture_output=True,
-            text=True
-        )
-
-        print(pip_install_result.stdout)
-
-        if pip_install_result.returncode != 0:
-            print(
-                "\n⚠️ pip install failed:"
-            )
-            print(pip_install_result.stderr)
-        else:
-            print(
-                "✅ Dependencies installed successfully."
-            )
-
-    
-
-
-    verify = run_project(
-        project_info
-    )
-
-
-    # ========================================================
-    # APPLICATION STILL FAILS
-    # ========================================================
-
-    if verify["returncode"] != 0:
-
-        print(
-            "\n❌ APPLICATION STILL FAILS"
-        )
-
-
-        print("\nNEW ERROR:")
-
-        print(
-            verify["stderr"]
-        )
-
-
-        # ----------------------------------------------------
-        # CHECK IF THIS FIX MADE PROGRESS
-        # (new error is DIFFERENT from the error that existed
-        # before this fix was applied)
-        # ----------------------------------------------------
-
-        made_progress = (verify["stderr"] != last_error)
-
-
-        if made_progress:
-
-            # ------------------------------------------------
-            # KEEP THE FIX — it changed the error, that's
-            # forward progress even though it's not fully fixed.
-            # ------------------------------------------------
-
-            print(
-                "\n✅ Progress made — new error is different. "
-                "Keeping this fix."
-            )
-
-            error = verify["stderr"]
-
-            last_error = verify["stderr"]
-
-            test_info = ""
-
-            attempt = 0
-
-            continue
-
-
-        # ----------------------------------------------------
-        # NO PROGRESS — roll back
-        # ----------------------------------------------------
-
-        # Only NOW is this a genuine failed fix — log it so the
-        # AI knows not to propose it again. Fixes that were kept
-        # (made_progress == True, above) must NOT be logged here,
-        # or PREVIOUS FAILED FIXES ends up full of stale old/new
-        # pairs referencing code that no longer exists in the
-        # file, which the model can hallucinate-blend together.
-        failed_fixes.append({
-            "file": fix["file"],
-            "old": fix["old"],
-            "new": fix["new"],
-            "error": verify["stderr"]
-        })
-
-        print(
-            "\n===== ROLLING BACK FAILED FIX (no progress) ====="
-        )
-
-        rollback = git_rollback(
-            project_path,
-            checkpoint_commit
-        )
-
-        if not rollback["success"]:
-
-            print(
-                "\n❌ Git rollback failed."
-            )
-
-            print(
-                rollback["stderr"]
-            )
-
-            break
-
-        print(
-            "✅ Failed fix rolled back."
-        )
-
-        error = verify["stderr"]
-
-        last_error = verify["stderr"]
-
-        test_info = ""
-
-        continue
-
-
-    # ========================================================
-    # APPLICATION SUCCESS
-    # ========================================================
-
-    print(
-        "\n✅ APPLICATION RUNS"
-    )
-
-
-    print(
-        "\nAPPLICATION OUTPUT:"
-    )
-
-
-    print(
-        verify["stdout"]
-    )
-
-
-    # ========================================================
-    # RUN TESTS AFTER FIX
-    # ========================================================
-
-    if project_info.get("test_framework"):
-
-        print(
-            "\n===== RUNNING TESTS ====="
-        )
-
-
-        test_result = run_tests(
-            project_path
-        )
-
-
-        print(
-            "\n===== TEST OUTPUT ====="
-        )
-
-
-        print(
-            test_result["stdout"]
-        )
-
-
-        if test_result["stderr"]:
-
-            print(
-                "\n===== TEST ERROR ====="
-            )
-
-            print(
-                test_result["stderr"]
+                "\n⚠️ No test framework detected."
             )
 
 
-        print(
-            "\n===== TEST RETURN CODE ====="
-        )
-
-
-        print(
-            test_result["returncode"]
-        )
-
-
-        # ====================================================
-        # TESTS PASS
-        # ====================================================
-
-        if test_result["returncode"] == 0:
-
-            print(
-                "\n✅ ALL TESTS PASSED"
-            )
-
-
-            # =================================================
+            # ====================================================
             # DOCKER VALIDATION
-            # =================================================
+            # ====================================================
 
             print(
                 "\n===== RUNNING DOCKER VALIDATION ====="
             )
 
 
-            docker_result = build_and_run_docker(
+            docker_result, debug_type = validate_docker(
                 project_path,
-                entry_point=project_info["entry_point"],
-                project_info=project_info
+                project_info
             )
 
 
@@ -1758,9 +2040,9 @@ ERROR:
             )
 
 
-            # =================================================
+            # ====================================================
             # DOCKER PASSED
-            # =================================================
+            # ====================================================
 
             if (
                 docker_result["build_returncode"] == 0
@@ -1772,17 +2054,15 @@ ERROR:
                 )
 
 
-                # =============================================
-                # COMMIT
-                # =============================================
-
                 print(
                     "\n===== COMMITTING SUCCESSFUL FIX ====="
                 )
 
+
                 commit_result = git_commit_success(
                     project_path
                 )
+
 
                 if not commit_result["success"]:
 
@@ -1796,20 +2076,23 @@ ERROR:
 
                     break
 
+
                 print(
                     "✅ Successful fix committed."
                 )
+
 
                 print(
                     "\n🎉 FIX SUCCESSFUL"
                 )
 
+
                 break
 
 
-            # =================================================
+            # ====================================================
             # DOCKER FAILED
-            # =================================================
+            # ====================================================
 
             else:
 
@@ -1817,29 +2100,19 @@ ERROR:
                     "\n❌ DOCKER VALIDATION FAILED"
                 )
 
-                if docker_result["build_returncode"] != 0:
-                    debug_type = "docker_build"
-                else:
-                    debug_type = "docker_runtime"
+                state.stored_debug_type = debug_type
 
-                stored_debug_type = debug_type
-
-                print(f"\n===== DEBUG: CLASSIFIED FAILURE AS: {debug_type} =====")
+                print(
+                    f"\n===== DEBUG: CLASSIFIED FAILURE AS: "
+                    f"{debug_type} ====="
+                )
 
 
-                if is_docker_infrastructure_error(docker_result):
-                            print("\n⚠️ DETECTED EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
-                            print("This looks like a registry/network issue, not a project problem.")
-                            debug_type = "docker_infrastructure"
-                            stored_debug_type = debug_type
+                state.error = (
 
+                    "The application runs successfully locally, "
 
-
-                error = (
-
-                    "The application and local tests passed, "
-
-                    "but the application failed inside Docker.\n\n"
+                    "but failed inside Docker.\n\n"
 
                     "DOCKER BUILD STDOUT:\n"
 
@@ -1860,14 +2133,7 @@ ERROR:
                 )
 
 
-                test_info = build_test_info(
-                    project_path,
-                    project_info,
-                    test_result
-                )
-
-
-                failed_fixes.append({
+                state.failed_fixes.append({
 
                     "file": fix["file"],
 
@@ -1875,14 +2141,10 @@ ERROR:
 
                     "new": fix["new"],
 
-                    "error": error
+                    "error": state.error
 
                 })
 
-
-                # =============================================
-                # ROLLBACK
-                # =============================================
 
                 print(
                     "\n===== ROLLING BACK DOCKER FAILED FIX ====="
@@ -1913,7 +2175,7 @@ ERROR:
                 )
 
 
-                if attempt == MAX_ATTEMPTS:
+                if state.attempt == MAX_ATTEMPTS:
 
                     print(
                         "\n❌ Maximum attempts reached."
@@ -1922,403 +2184,20 @@ ERROR:
                     break
 
 
-                print(
-                    "\n🔄 Docker failure stored."
-                )
-
-                print(
-                    "AI will analyze the Docker failure "
-                    "on the next attempt."
-                )
-
-
                 continue
 
 
-        # ====================================================
-        # TESTS FAILED AFTER FIX
-        # ====================================================
-
-        else:
-
-            print(
-                "\n❌ TESTS FAILED"
-            )
-
-
-            current_failed_count = count_failed_tests(
-                test_result["stdout"]
-            )
-
-
-            made_progress = current_failed_count < last_failed_count
-
-
-            if made_progress:
-
-                # ----------------------------------------------
-                # KEEP THE FIX — fewer tests are failing now.
-                # ----------------------------------------------
-
-                print(
-                    f"\n✅ Progress made — failed test count "
-                    f"dropped from {last_failed_count} to "
-                    f"{current_failed_count}. Keeping this fix."
-                )
-
-                last_failed_count = current_failed_count
-
-                attempt = 0
-
-            else:
-
-                # ----------------------------------------------
-                # ROLLBACK — no improvement, or it got worse.
-                #
-                # Only NOW is this a genuine failed fix — log it
-                # so the AI knows not to propose it again. Fixes
-                # that were kept (made_progress == True, above)
-                # must NOT be logged here, or PREVIOUS FAILED
-                # FIXES ends up full of stale old/new pairs
-                # referencing code that no longer exists in the
-                # file, which the model can hallucinate-blend
-                # together into fabricated "old" text.
-                # ----------------------------------------------
-
-                failed_fixes.append({
-
-                    "file": fix["file"],
-
-                    "old": fix["old"],
-
-                    "new": fix["new"],
-
-                    "error": (
-                        test_result["stdout"]
-                        + "\n"
-                        + test_result["stderr"]
-                    )
-
-                })
-
-                print(
-                    "\n===== ROLLING BACK FAILED FIX "
-                    "(no test progress) ====="
-                )
-
-                rollback = git_rollback(
-                    project_path,
-                    checkpoint_commit
-                )
-
-                if not rollback["success"]:
-
-                    print(
-                        "\n❌ Git rollback failed."
-                    )
-
-                    print(
-                        rollback["stderr"]
-                    )
-
-                    break
-
-                print(
-                    "✅ Failed fix rolled back."
-                )
-
-
-            # ------------------------------------------------
-            # STORE TEST ERROR
-            # ------------------------------------------------
-
-            error = (
-
-                "The application runs successfully, "
-
-                "but the automated tests are failing.\n\n"
-
-                "TEST OUTPUT:\n"
-
-                + test_result["stdout"]
-
-                + "\n\nTEST ERROR:\n"
-
-                + test_result["stderr"]
-
-            )
-
-
-            test_info = build_test_info(
-                project_path,
-                project_info,
-                test_result
-            )
-
-
-            print(
-                "🔄 Test failure stored."
-            )
-
-            print(
-                "AI will analyze the test failure again."
-            )
-
-
-            if attempt == MAX_ATTEMPTS:
-
-                print(
-                    "\n❌ Maximum attempts reached."
-                )
-
-                break
-
-
-            continue
-
-
-    # ========================================================
-    # NO TEST FRAMEWORK AFTER FIX
-    # ========================================================
-
-    else:
-
-        print(
-            "\n⚠️ No test framework detected."
-        )
-
-
-        # ====================================================
-        # DOCKER VALIDATION
-        # ====================================================
-
-        print(
-            "\n===== RUNNING DOCKER VALIDATION ====="
-        )
-
-
-        docker_result = build_and_run_docker(
-            project_path,
-            entry_point=project_info["entry_point"],
-            project_info=project_info
-        )
-
-
-        print(
-            "\n===== DOCKER BUILD STDOUT ====="
-        )
-
-
-        print(
-            docker_result["build_stdout"]
-        )
-
-
-        print(
-            "\n===== DOCKER BUILD STDERR ====="
-        )
-
-
-        print(
-            docker_result["build_stderr"]
-        )
-
-
-        print(
-            "\n===== DOCKER BUILD RETURN CODE ====="
-        )
-
-
-        print(
-            docker_result["build_returncode"]
-        )
-
-
-        print(
-            "\n===== DOCKER CONTAINER STDOUT ====="
-        )
-
-
-        print(
-            docker_result["run_stdout"]
-        )
-
-
-        print(
-            "\n===== DOCKER CONTAINER STDERR ====="
-        )
-
-
-        print(
-            docker_result["run_stderr"]
-        )
-
-
-        print(
-            "\n===== DOCKER CONTAINER RETURN CODE ====="
-        )
-
-
-        print(
-            docker_result["run_returncode"]
-        )
-
-
-        # ====================================================
-        # DOCKER PASSED
-        # ====================================================
-
-        if (
-            docker_result["build_returncode"] == 0
-            and docker_result["run_returncode"] == 0
-        ):
-
-            print(
-                "\n✅ DOCKER VALIDATION PASSED"
-            )
-
-
-            print(
-                "\n===== COMMITTING SUCCESSFUL FIX ====="
-            )
-
-
-            commit_result = git_commit_success(
-                project_path
-            )
-
-
-            if not commit_result["success"]:
-
-                print(
-                    "\n❌ Could not commit successful fix."
-                )
-
-                print(
-                    commit_result["stderr"]
-                )
-
-                break
-
-
-            print(
-                "✅ Successful fix committed."
-            )
-
-
-            print(
-                "\n🎉 FIX SUCCESSFUL"
-            )
-
-
-            break
-
-
-        # ====================================================
-        # DOCKER FAILED
-        # ====================================================
-
-        else:
-
-            print(
-                "\n❌ DOCKER VALIDATION FAILED"
-            )
-
-            if docker_result["build_returncode"] != 0:
-                debug_type = "docker_build"
-            else:
-                debug_type = "docker_runtime"
-            stored_debug_type = debug_type
-
-            print(f"\n===== DEBUG: CLASSIFIED FAILURE AS: {debug_type} =====")
-
-
-            if is_docker_infrastructure_error(docker_result):
-                            print("\n⚠️ DETECTED EXTERNAL DOCKER INFRASTRUCTURE FAILURE")
-                            print("This looks like a registry/network issue, not a project problem.")
-                            debug_type = "docker_infrastructure"
-                            stored_debug_type = debug_type
-
-
-            error = (
-
-                "The application runs successfully locally, "
-
-                "but failed inside Docker.\n\n"
-
-                "DOCKER BUILD STDOUT:\n"
-
-                + docker_result["build_stdout"]
-
-                + "\n\nDOCKER BUILD STDERR:\n"
-
-                + docker_result["build_stderr"]
-
-                + "\n\nDOCKER CONTAINER STDOUT:\n"
-
-                + docker_result["run_stdout"]
-
-                + "\n\nDOCKER CONTAINER STDERR:\n"
-
-                + docker_result["run_stderr"]
-
-            )
-
-
-            failed_fixes.append({
-
-                "file": fix["file"],
-
-                "old": fix["old"],
-
-                "new": fix["new"],
-
-                "error": error
-
-            })
-
-
-            print(
-                "\n===== ROLLING BACK DOCKER FAILED FIX ====="
-            )
-
-
-            rollback = git_rollback(
-                project_path,
-                checkpoint_commit
-            )
-
-
-            if not rollback["success"]:
-
-                print(
-                    "\n❌ Git rollback failed."
-                )
-
-                print(
-                    rollback["stderr"]
-                )
-
-                break
-
-
-            print(
-                "✅ Docker failed fix rolled back."
-            )
-
-
-            if attempt == MAX_ATTEMPTS:
-
-                print(
-                    "\n❌ Maximum attempts reached."
-                )
-
-                break
-
-
-            continue
-
-
-    print("\n========================================")
-    print("        DEVOPS AGENT FINISHED")
-    print("========================================")
+        print("\n========================================")
+        print("        DEVOPS AGENT FINISHED")
+
+
+# ============================================================
+# START AGENT LOOP
+# ============================================================
+
+run_agent_loop(
+    project_path,
+    project_info,
+    state,
+    llm_client
+)
