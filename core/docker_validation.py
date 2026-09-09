@@ -1,4 +1,140 @@
+import os
+import re
+
 from tools.docker_tools import build_and_run_docker
+
+
+def analyze_docker_startup(
+    dockerfile,
+    project_path,
+    project_info,
+    dockerignore,
+    error
+):
+    """
+    Collect deterministic evidence about Docker container startup.
+
+    This function does NOT decide or apply a fix.
+    It only reports facts for the LLM to reason about.
+    """
+
+    diagnostics = []
+
+    entry_point = project_info.get("entry_point", "")
+
+    # --------------------------------------------------------
+    # Check whether the runtime error looks like a missing file
+    # --------------------------------------------------------
+
+    missing_file_match = re.search(
+        r"can't open file ['\"]([^'\"]+)['\"]",
+        error,
+        re.IGNORECASE
+    )
+
+    if not missing_file_match:
+        return "No Python startup file-not-found pattern detected."
+
+    requested_path = missing_file_match.group(1)
+    requested_file = os.path.basename(requested_path)
+
+    diagnostics.append(
+        f"Runtime error references file: {requested_file}"
+    )
+
+    # --------------------------------------------------------
+    # Extract CMD / ENTRYPOINT target from CURRENT Dockerfile
+    # --------------------------------------------------------
+
+    startup_target = None
+
+    cmd_match = re.search(
+        r'CMD\s*\[\s*"[^"]+"\s*,\s*"([^"]+)"\s*\]',
+        dockerfile,
+        re.IGNORECASE
+    )
+
+    entrypoint_match = re.search(
+        r'ENTRYPOINT\s*\[\s*"[^"]+"\s*,\s*"([^"]+)"\s*\]',
+        dockerfile,
+        re.IGNORECASE
+    )
+
+    if cmd_match:
+        startup_target = os.path.basename(cmd_match.group(1))
+        diagnostics.append(
+            f"CMD startup target: {startup_target}"
+        )
+
+    elif entrypoint_match:
+        startup_target = os.path.basename(
+            entrypoint_match.group(1)
+        )
+        diagnostics.append(
+            f"ENTRYPOINT startup target: {startup_target}"
+        )
+
+    else:
+        diagnostics.append(
+            "No simple Python CMD/ENTRYPOINT startup target detected."
+        )
+
+    # --------------------------------------------------------
+    # Check whether startup target exists in project
+    # --------------------------------------------------------
+
+    if startup_target:
+        startup_file_path = os.path.join(
+            project_path,
+            startup_target
+        )
+
+        diagnostics.append(
+            f"Startup target exists in project: "
+            f"{os.path.exists(startup_file_path)}"
+        )
+
+    # --------------------------------------------------------
+    # Compare startup target with project entry point
+    # --------------------------------------------------------
+
+    if startup_target and entry_point:
+        entry_filename = os.path.basename(entry_point)
+
+        diagnostics.append(
+            f"Project entry file: {entry_filename}"
+        )
+
+        diagnostics.append(
+            f"Startup target matches project entry file: "
+            f"{startup_target == entry_filename}"
+        )
+
+    # --------------------------------------------------------
+    # Check Dockerignore
+    # --------------------------------------------------------
+
+    ignored_files = {
+        line.strip()
+        for line in dockerignore.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+
+    if startup_target:
+        diagnostics.append(
+            f"Startup target listed in .dockerignore: "
+            f"{startup_target in ignored_files}"
+        )
+
+    if entry_point:
+        entry_filename = os.path.basename(entry_point)
+
+        diagnostics.append(
+            f"Project entry file listed in .dockerignore: "
+            f"{entry_filename in ignored_files}"
+        )
+
+    return "\n".join(diagnostics)
 
 
 def is_docker_infrastructure_error(docker_result):

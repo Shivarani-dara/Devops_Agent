@@ -19,7 +19,10 @@ from project.runner import run_project
 
 
 from core.state import AgentState
-from core.docker_validation import validate_docker
+from core.docker_validation import (
+    validate_docker,
+    analyze_docker_startup
+)
 
 
 from tools.test_tools import run_tests
@@ -706,6 +709,17 @@ def run_agent_loop(project_path, project_info, state, llm_client):
             print("\n===== DEBUG: DOCKERIGNORE SENT TO AI =====")
             print(dockerignore_content)
 
+            docker_startup_diagnostics = analyze_docker_startup(
+                dockerfile_content,
+                project_path,
+                project_info,
+                dockerignore_content,
+                state.error
+            )
+
+            print("\n===== DOCKER STARTUP DIAGNOSTICS =====")
+            print(docker_startup_diagnostics)
+
             prompt = docker_failure_prompt(
                 project_path,
                 app_file,
@@ -713,6 +727,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                 docker_source_code,
                 dockerfile_content,
                 dockerignore_content,
+                docker_startup_diagnostics,
                 project_info,
                 failed_fix_info=failed_fix_info
             )

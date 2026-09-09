@@ -541,47 +541,22 @@ def docker_failure_prompt(
     code,
     dockerfile,
     dockerignore,
-    project_info,
+    docker_startup_diagnostics="",
+    project_info=None,
     failed_fix_info=""
 ):
     return f"""
 You are an expert DevOps debugging agent.
 
-The application runs successfully and local automated tests pass,
-but Docker validation has failed.
+Docker validation failed after the application and local tests passed.
 
-Your task is to diagnose the ACTUAL Docker failure and propose ONE
-minimal fix.
-
-IMPORTANT:
-The failure may be caused by:
-
-- Dockerfile configuration
-- base image
-- dependency installation
-- COPY paths
-- WORKDIR
-- CMD or ENTRYPOINT
-- environment variables
-- exposed ports
-- container startup command
-- missing files
-- Python/runtime configuration
-- Docker build configuration
-
-It may also be caused by an external infrastructure problem such as:
-
-- Docker registry failure
-- image pull failure
-- proxy/network problem
-- DNS problem
-- authentication problem
-
-Do NOT modify application source code unless the Docker error
-clearly proves that the application code is responsible.
+Your task:
+1. Identify the ACTUAL Docker root cause.
+2. Propose ONE minimal project-file change.
+3. Return ONLY valid JSON.
 
 ==================================================
-PROJECT
+CURRENT PROJECT
 ==================================================
 
 Project:
@@ -594,31 +569,40 @@ Project information:
 {project_info}
 
 ==================================================
-DOCKER FAILURE
+CURRENT DOCKER ERROR
 ==================================================
 
 {error}
 
 ==================================================
-DOCKERFILE
+CURRENT DOCKERFILE
 ==================================================
 
 {dockerfile}
 
-
 ==================================================
-DOCKERIGNORE
+CURRENT DOCKERIGNORE
 ==================================================
 
 {dockerignore}
 
-If a file the application needs (such as the entry point) is
-listed in DOCKERIGNORE, that is very likely why the file is
-missing inside the container. Consider removing that line from
-.dockerignore as a possible fix, in addition to any Dockerfile fix.
+==================================================
+DETERMINISTIC STARTUP DIAGNOSTICS
+==================================================
+
+{docker_startup_diagnostics}
+
+These diagnostics were calculated from the CURRENT project.
+
+Treat them as factual evidence.
+
+They do NOT directly specify the fix.
+
+Use them together with the CURRENT Dockerfile, CURRENT
+.dockerignore, CURRENT error, and project information.
 
 ==================================================
-CURRENT APPLICATION SOURCE CODE
+CURRENT APPLICATION SOURCE
 ==================================================
 
 {code}
@@ -629,213 +613,162 @@ PREVIOUS FAILED ATTEMPTS
 
 {failed_fix_info}
 
-IMPORTANT:
+Previous attempts are historical only.
 
-Previous failed attempts refer to older attempts.
+NEVER copy an old/new value from previous attempts.
 
-NEVER copy their "old" or "new" values.
-
-Only CURRENT SOURCE CODE or CURRENT DOCKERFILE may be used
-when constructing the "old" value.
+NEVER assume a file still contains text from a previous attempt.
 
 ==================================================
-DEBUGGING PROCESS
+STRICT REASONING RULES
 ==================================================
 
-Follow this process:
+Reason ONLY from the CURRENT project state.
 
-1. Read the complete Docker error.
+Do NOT use examples, remembered values, or previous attempts
+as evidence.
 
-2. Determine whether the failure happened during:
+Do NOT invent file contents.
 
-   - Docker image build
-   - dependency installation
-   - image creation
-   - container startup
-   - application execution inside container
+Do NOT modify application source code unless the Docker error
+clearly proves that application source code is the root cause.
 
-3. Identify the exact failing command or Dockerfile instruction.
+Determine which CURRENT project file actually owns the problem.
 
+Possible files include:
 
-4. Determine the root cause.
-
-5. Identify WHICH PROJECT FILE owns the failing instruction.
-
-- If the error is "can't open file '<something>.py'" or another
-  file-not-found error during CONTAINER STARTUP, trace the file
-  from the startup command to the Docker image.
-
-  First check CMD or ENTRYPOINT:
-  - If it references the WRONG filename, fix the filename.
-  - If it already references the correct Entry file "{app_file}",
-    DO NOT modify CMD or ENTRYPOINT.
-
-  If CMD/ENTRYPOINT is already correct, inspect:
-  1. WORKDIR
-  2. COPY or ADD instructions
-  3. .dockerignore
-
-  If the required entry file "{app_file}" is listed in .dockerignore,
-  the .dockerignore entry is the root cause because Docker excludes
-  that file from COPY . .
-
-  In that case, modify .dockerignore by removing ONLY the exact
-  line containing "{app_file}".
-
-- If the error occurs while installing Python dependencies and
-  specifically identifies requirements.txt as the problem:
-  MODIFY requirements.txt.
-
-- If the Docker build succeeds but the application crashes
-  inside the container because of application logic:
-  MODIFY the appropriate application source file.
-
-- NEVER modify application source code merely because it is
-  available in the project.
-
-6. For Dockerfile errors, inspect the CURRENT DOCKERFILE and
-   find the exact instruction responsible for the error.
-
-7. If the Dockerfile contains an invalid image tag, invalid
-   instruction, incorrect path, incorrect command, or incorrect
-   runtime configuration, modify the Dockerfile.
-
-8. If the error is genuinely caused by external infrastructure
-   such as a registry outage, proxy failure, DNS failure,
-   network timeout, or authentication failure, DO NOT invent
-   a project-file fix.
-
-9. Make ONE minimal change.
-
-10. Do not modify tests.
-
-11. Do not rewrite the entire Dockerfile unnecessarily.
-
-12. Do not modify unrelated files.
-
-
-6. If the problem is an external infrastructure issue such as:
-
-   - registry unavailable
-   - proxy returning 403
-   - network failure
-   - DNS failure
-   - authentication failure
-
-   DO NOT invent a source-code fix.
-
-7. If the Dockerfile is responsible, modify the Dockerfile.
-
-8. If application source code is responsible, modify the
-   appropriate source file.
-
-9. Make ONE minimal change.
-
-10. Do not modify tests.
-
-11. Do not rewrite the entire Dockerfile unnecessarily.
-
-12. Do not modify unrelated files.
+- Dockerfile
+- .dockerignore
+- requirements.txt
+- an application source file
 
 ==================================================
-CRITICAL "old" RULE
+DOCKERFILE / DOCKERIGNORE DECISION
 ==================================================
 
-The "old" value MUST be copied directly from the CURRENT FILE
-being modified.
+For a container startup failure involving a missing file:
 
-The "old" value MUST be as SHORT as possible — ideally ONE line,
-and NEVER more than 2-3 lines. Do NOT copy the entire file as
-"old". Whole-file replacements almost always fail to match the
-real file exactly and will be rejected. Pick the single specific
-line that needs to change.
+1. Identify the file referenced by the CURRENT Docker error.
 
-If the fix is to remove a line from .dockerignore, set "file" to
-".dockerignore" and "old" to just that one line.
+2. Check the CURRENT Dockerfile CMD/ENTRYPOINT.
 
-For example, if modifying the Dockerfile:
+3. Check whether that startup target exists in the project.
 
-OLD:
+4. Check whether the required file is excluded by the CURRENT
+   .dockerignore.
 
-FROM python:3.10-slim
+5. Check WORKDIR and COPY/ADD instructions.
 
-then "old" must literally exist in the Dockerfile.
+6. Determine which CURRENT configuration actually causes the
+   failure.
 
-If modifying app.py:
+If CMD/ENTRYPOINT is wrong, modify Dockerfile.
 
-OLD:
+If CMD/ENTRYPOINT is correct but the required file is excluded
+by .dockerignore, modify .dockerignore.
 
-return a + b
+If COPY/WORKDIR is responsible, modify Dockerfile.
 
-then that exact code must exist in the current app.py.
+Do NOT change CMD merely because a file is missing.
 
-Do NOT put the Docker error inside "old".
+Do NOT change .dockerignore merely because Docker failed.
 
-Do NOT put explanations inside "old".
-
-Do NOT put line numbers inside "old".
-
-Do NOT use code from previous failed attempts.
-
-Do NOT invent an "old" value.
+Use the CURRENT evidence to decide.
 
 ==================================================
-EXTERNAL FAILURE RULE
+EXTERNAL FAILURE
 ==================================================
 
-If the Docker failure is clearly caused by an external system
-and there is no safe project-file change that can fix it,
-return:
+If the failure is caused by external infrastructure such as:
 
-{{
-    "file": "",
-    "old": "",
-    "new": "",
-    "reason": "External Docker infrastructure failure: explain the actual cause"
-}}
-
-Examples include:
-
-- 403 Forbidden from Docker registry
-- registry unavailable
+- registry outage
+- image pull failure
+- proxy failure
 - DNS failure
 - network timeout
 - authentication failure
 
-Do NOT change application code just to make an external
-Docker failure disappear.
+do NOT invent a project-file fix.
 
-==================================================
-OUTPUT FORMAT
-==================================================
-
-Return ONLY valid JSON.
-
-If a project-file fix is required:
-
-{{
-    "file": "Dockerfile",
-    "old": "exact existing source",
-    "new": "replacement source",
-    "reason": "short explanation"
-}}
-
-If application code must be changed:
-
-{{
-    "file": "app.py",
-    "old": "exact existing source",
-    "new": "replacement source",
-    "reason": "short explanation"
-}}
-
-If the failure is external:
+Return:
 
 {{
     "file": "",
     "old": "",
     "new": "",
     "reason": "External Docker infrastructure failure: explain the actual cause"
+}}
+
+==================================================
+STRICT "old" RULE
+==================================================
+
+The "old" value MUST be copied EXACTLY from the CURRENT file
+identified in "file".
+
+Before returning JSON, verify:
+
+CURRENT FILE contains OLD exactly.
+
+If it does not, the proposed fix is INVALID.
+
+Never use:
+
+- previous attempt text
+- hypothetical text
+- example text
+- Docker error text
+- invented text
+
+as "old".
+
+Keep "old" minimal: preferably one exact line.
+
+For .dockerignore, if removing one ignored file, "old" should
+be exactly that current line.
+
+==================================================
+STRICT "new" RULE
+==================================================
+
+"new" must be the exact replacement for "old".
+
+Make ONE minimal change.
+
+Do not rewrite the entire file.
+
+Do not modify tests.
+
+Do not modify unrelated files.
+
+==================================================
+FINAL CHECK BEFORE JSON
+==================================================
+
+Verify all of these:
+
+1. The diagnosis matches the CURRENT Docker error.
+2. The selected file is actually responsible.
+3. "old" literally exists in the CURRENT file.
+4. "old" is copied character-for-character.
+5. "new" is the minimal replacement.
+6. No previous failed fix is being repeated.
+7. No test is modified.
+8. No unrelated file is modified.
+
+==================================================
+OUTPUT
+==================================================
+
+Return ONLY JSON.
+
+For a project-file fix:
+
+{{
+    "file": "exact current filename",
+    "old": "exact text copied from that current file",
+    "new": "replacement text",
+    "reason": "short explanation based only on current evidence"
 }}
 
 Return the JSON now.

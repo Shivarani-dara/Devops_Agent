@@ -220,11 +220,28 @@ def validate_dockerignore_fix(content, old_text, new_text):
             "reason": "OLD value is empty."
         }
 
-    if old_text not in content:
+    # .dockerignore is line-based, so ignore harmless surrounding
+    # whitespace/newline differences in the LLM's OLD value.
+    normalized_old = old_text.strip()
+
+    matching_lines = [
+        line for line in content.splitlines()
+        if line.strip() == normalized_old
+    ]
+
+    if not matching_lines:
         return {
             "valid": False,
             "reason": "OLD Dockerignore text was not found in the current .dockerignore file."
         }
+
+    if len(matching_lines) > 1:
+        return {
+            "valid": False,
+            "reason": "OLD text appears more than once in .dockerignore; it must be unique."
+        }
+
+    old_text = matching_lines[0]
 
     occurrence_count = content.count(old_text)
 
