@@ -11,7 +11,7 @@ pipeline {
 
         stage('Run Tests') {
             steps {
-                sh 'python3 -m pytest tests/nonexist.py'
+                sh 'python3 -m pytest test_project/tests/test_app.py'
             }
         }
 
