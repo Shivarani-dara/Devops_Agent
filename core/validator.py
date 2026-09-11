@@ -314,4 +314,181 @@ def validate_requirements_fix(content, old_text, new_text):
         "resolved_old": old_text
     }
 
-    
+def validate_jenkins_fix(jenkins_config, fix, project_info=None):
+    """
+    Validate an LLM-generated Jenkins Pipeline fix.
+
+    Checks:
+    1. Fix structure
+    2. Old command exists in Jenkins config
+    3. Old and new commands differ
+    4. Referenced project paths actually exist
+    5. Project-relative paths are converted to repository-relative paths
+    """
+
+    if not isinstance(fix, dict):
+        return {
+            "valid": False,
+            "reason": "Fix proposal is not a dictionary"
+        }
+
+    old = fix.get("old", "").strip()
+    new = fix.get("new", "").strip()
+
+    if not old:
+        return {
+            "valid": False,
+            "reason": "Fix proposal has no old command"
+        }
+
+    if not new:
+        return {
+            "valid": False,
+            "reason": "Fix proposal has no new command"
+        }
+
+    # ---------------------------------------------------------
+    # 1. OLD command must exist in Jenkins configuration
+    # ---------------------------------------------------------
+
+    if old not in jenkins_config:
+        return {
+            "valid": False,
+            "reason": (
+                "The proposed old command does not exist "
+                "in the Jenkins Pipeline configuration"
+            )
+        }
+
+    # ---------------------------------------------------------
+    # 2. OLD and NEW must be different
+    # ---------------------------------------------------------
+
+    if old == new:
+        return {
+            "valid": False,
+            "reason": "Old and new commands are identical"
+        }
+
+    # ---------------------------------------------------------
+    # 3. Validate paths using EXACT command tokens
+    # ---------------------------------------------------------
+
+    if project_info:
+
+        project_path = project_info.get(
+            "project_path",
+            ""
+        ).strip()
+
+        available_files = set(
+            project_info.get("files", [])
+        )
+
+        project_relative_paths = set(
+            available_files
+        )
+
+        repository_relative_paths = set()
+
+        if project_path:
+            repository_relative_paths = {
+                f"{project_path}/{file}"
+                for file in available_files
+            }
+
+        # Split command into tokens.
+        #
+        # Example:
+        #
+        # python3 -m pytest test_project/tests/test_app.py
+        #
+        # becomes approximately:
+        #
+        # python3
+        # -m
+        # pytest
+        # test_project/tests/test_app.py
+
+        import shlex
+
+        try:
+            tokens = shlex.split(new)
+        except ValueError as exc:
+            return {
+                "valid": False,
+                "reason": f"Invalid shell command syntax: {exc}"
+            }
+
+        for token in tokens:
+
+            # Ignore flags and Python/module names.
+            if token.startswith("-"):
+                continue
+
+            # -------------------------------------------------
+            # Exact repository-relative path
+            # -------------------------------------------------
+
+            if token in repository_relative_paths:
+                continue
+
+            # -------------------------------------------------
+            # Exact project-relative path
+            # -------------------------------------------------
+
+            if token in project_relative_paths:
+
+                # Jenkins executes from repository root.
+                #
+                # Therefore:
+                #
+                # tests/test_app.py
+                #
+                # should normally become:
+                #
+                # test_project/tests/test_app.py
+
+                if project_path:
+
+                    repository_path = (
+                        f"{project_path}/{token}"
+                    )
+
+                    return {
+                        "valid": False,
+                        "reason": (
+                            f"The path '{token}' is relative "
+                            f"to the project directory. Jenkins "
+                            f"runs from the repository root. "
+                            f"Use '{repository_path}' instead."
+                        )
+                    }
+
+                continue
+
+            # -------------------------------------------------
+            # Detect likely filesystem paths that don't exist
+            # -------------------------------------------------
+
+            looks_like_path = (
+                "/" in token
+                or token.endswith(".py")
+                or token.endswith(".yaml")
+                or token.endswith(".yml")
+                or token.endswith(".json")
+            )
+
+            if looks_like_path:
+                return {
+                    "valid": False,
+                    "reason": (
+                        "The new command references a path "
+                        f"that does not exist in the project: {token}"
+                    )
+                }
+
+    return {
+        "valid": True,
+        "reason": "Jenkins fix passed validation"
+    }
