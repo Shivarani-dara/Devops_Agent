@@ -377,7 +377,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
 
                             print("\n🎉 PROJECT SUCCESSFUL")
 
-                            return True
+                            break
 
 
                         # =================================================
@@ -1780,7 +1780,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                         "\n🎉 FIX SUCCESSFUL"
                     )
 
-                    return True
+                    break
 
 
                 # =================================================
@@ -2573,29 +2573,6 @@ def run_jenkins_repair(
             print(
                 "\n✅ Existing debugging engine "
                 "completed the repair."
-            )
-
-            print(
-                "\n===== PUSHING EXISTING DEBUGGING FIX ====="
-            )
-
-            push_result = git_push(
-                str(Path(project_path).resolve()),
-                remote="origin",
-                branch="main"
-            )
-
-            if not push_result["success"]:
-
-                print(
-                    "\n❌ Could not push debugging fix."
-                )
-                print(push_result["stderr"])
-
-                return False
-
-            print(
-                "✅ Existing debugging fix pushed to GitHub."
             )
 
             # ----------------------------------------------------

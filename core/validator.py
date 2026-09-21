@@ -318,13 +318,14 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
     """
     Validate an LLM-generated Jenkins Pipeline fix.
 
-    Checks:
-    1. Fix structure
-    2. Old command exists in Jenkins config
-    3. Old and new commands differ
-    4. Referenced project paths actually exist
-    5. Project-relative paths are converted to repository-relative paths
+    Jenkins operates from the root of the repository being repaired.
+    Therefore paths discovered by the project scanner are already
+    repository-relative paths.
     """
+
+    # ---------------------------------------------------------
+    # 1. Validate fix structure
+    # ---------------------------------------------------------
 
     if not isinstance(fix, dict):
         return {
@@ -348,7 +349,7 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
         }
 
     # ---------------------------------------------------------
-    # 1. OLD command must exist in Jenkins configuration
+    # 2. OLD command must exist in Jenkins configuration
     # ---------------------------------------------------------
 
     if old not in jenkins_config:
@@ -361,7 +362,7 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
         }
 
     # ---------------------------------------------------------
-    # 2. OLD and NEW must be different
+    # 3. OLD and NEW must differ
     # ---------------------------------------------------------
 
     if old == new:
@@ -371,44 +372,25 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
         }
 
     # ---------------------------------------------------------
-    # 3. Validate paths using EXACT command tokens
+    # 4. Validate paths against scanner output
     # ---------------------------------------------------------
 
     if project_info:
-
-        project_path = project_info.get(
-            "project_path",
-            ""
-        ).strip()
 
         available_files = set(
             project_info.get("files", [])
         )
 
-        project_relative_paths = set(
-            available_files
-        )
+        # Build a set of directories from the discovered files.
+        available_directories = set()
 
-        repository_relative_paths = set()
+        for file_path in available_files:
+            parts = file_path.split("/")
 
-        if project_path:
-            repository_relative_paths = {
-                f"{project_path}/{file}"
-                for file in available_files
-            }
-
-        # Split command into tokens.
-        #
-        # Example:
-        #
-        # python3 -m pytest test_project/tests/test_app.py
-        #
-        # becomes approximately:
-        #
-        # python3
-        # -m
-        # pytest
-        # test_project/tests/test_app.py
+            for i in range(1, len(parts)):
+                available_directories.add(
+                    "/".join(parts[:i])
+                )
 
         import shlex
 
@@ -420,63 +402,64 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
                 "reason": f"Invalid shell command syntax: {exc}"
             }
 
+        # Commands/interpreters that are not filesystem paths.
+        known_commands = {
+            "python",
+            "python3",
+            "pytest",
+            "pip",
+            "pip3",
+            "npm",
+            "npx",
+            "yarn",
+            "node",
+            "java",
+            "mvn",
+            "gradle",
+            "docker",
+            "git",
+            "sh",
+            "bash"
+        }
+
         for token in tokens:
 
-            # Ignore flags and Python/module names.
+            # Ignore command-line flags.
             if token.startswith("-"):
                 continue
 
-            # -------------------------------------------------
-            # Exact repository-relative path
-            # -------------------------------------------------
-
-            if token in repository_relative_paths:
+            # Ignore known executable names.
+            if token in known_commands:
                 continue
 
-            # -------------------------------------------------
-            # Exact project-relative path
-            # -------------------------------------------------
-
-            if token in project_relative_paths:
-
-                # Jenkins executes from repository root.
-                #
-                # Therefore:
-                #
-                # tests/test_app.py
-                #
-                # should normally become:
-                #
-                # test_project/tests/test_app.py
-
-                if project_path:
-
-                    repository_path = (
-                        f"{project_path}/{token}"
-                    )
-
-                    return {
-                        "valid": False,
-                        "reason": (
-                            f"The path '{token}' is relative "
-                            f"to the project directory. Jenkins "
-                            f"runs from the repository root. "
-                            f"Use '{repository_path}' instead."
-                        )
-                    }
-
+            # Ignore common Python module names.
+            if token in {
+                "pytest",
+                "unittest"
+            }:
                 continue
 
-            # -------------------------------------------------
-            # Detect likely filesystem paths that don't exist
-            # -------------------------------------------------
+            # A path explicitly discovered by the scanner is valid.
+            if token in available_files:
+                continue
 
+            # A discovered directory is also valid.
+            if token in available_directories:
+                continue
+
+            # Detect values that look like filesystem paths.
             looks_like_path = (
                 "/" in token
                 or token.endswith(".py")
                 or token.endswith(".yaml")
                 or token.endswith(".yml")
                 or token.endswith(".json")
+                or token.endswith(".toml")
+                or token.endswith(".txt")
+                or token.endswith(".xml")
+                or token.endswith(".java")
+                or token.endswith(".js")
+                or token.endswith(".ts")
             )
 
             if looks_like_path:
@@ -488,7 +471,13 @@ def validate_jenkins_fix(jenkins_config, fix, project_info=None):
                     )
                 }
 
+    # ---------------------------------------------------------
+    # 5. Fix passed validation
+    # ---------------------------------------------------------
+
     return {
         "valid": True,
         "reason": "Jenkins fix passed validation"
     }
+
+

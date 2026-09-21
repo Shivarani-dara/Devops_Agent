@@ -343,6 +343,12 @@ def test_failure_prompt(
     source_files,
     failed_fix_info=""
 ):
+    project_files = (
+        project_info.get("files", [])
+        if project_info
+        else []
+    )
+
     return f"""
 You are a Python debugging agent.
 
@@ -534,6 +540,102 @@ Use exactly:
 
 Return the JSON now.
 """
+
+def dockerignore_failure_prompt(
+    error,
+    dockerignore,
+    docker_startup_diagnostics="",
+    failed_fix_info=""
+):
+    return f"""
+You are a DevOps debugging agent specializing in .dockerignore failures.
+
+The deterministic Docker diagnostics have identified that the Docker
+startup failure is caused by a file being excluded by .dockerignore.
+
+Your task:
+1. Identify the exact ignored entry responsible for the failure.
+2. Propose ONE minimal change to .dockerignore.
+3. Return ONLY valid JSON.
+
+==================================================
+CURRENT DOCKER ERROR
+==================================================
+
+{error}
+
+==================================================
+CURRENT DOCKERIGNORE
+==================================================
+
+{dockerignore}
+
+==================================================
+DETERMINISTIC DIAGNOSTICS
+==================================================
+
+{docker_startup_diagnostics}
+
+Treat these diagnostics as factual evidence.
+
+==================================================
+PREVIOUS FAILED ATTEMPTS
+==================================================
+
+{failed_fix_info}
+
+Previous attempts are historical only.
+Do not copy old/new values from them.
+
+==================================================
+PATCH SEMANTICS
+==================================================
+
+The "old" value MUST be text that currently exists in the
+CURRENT .dockerignore file.
+
+The "new" value MUST be the exact replacement for "old".
+
+If an existing ignored entry must be removed:
+
+- "old" MUST contain the exact existing ignored entry.
+- "new" MUST be an empty string.
+
+For the current situation, CURRENT .dockerignore contains:
+
+app.py
+
+Therefore, if app.py is the entry causing the failure:
+
+- old MUST be: app.py
+- new MUST be empty
+
+NEVER use an empty "old" value.
+
+NEVER invent text that does not currently exist in .dockerignore.
+
+NEVER add app.py back when app.py is already present and causing
+the Docker startup failure.
+
+The "old" value MUST be copied from CURRENT .dockerignore above.
+
+Make exactly ONE minimal change.
+
+==================================================
+OUTPUT
+==================================================
+
+Return ONLY valid JSON with these four fields:
+
+file
+old
+new
+reason
+
+The file MUST be .dockerignore.
+"""
+
+
 def docker_failure_prompt(
     project_path,
     app_file,
@@ -545,6 +647,12 @@ def docker_failure_prompt(
     project_info=None,
     failed_fix_info=""
 ):
+    project_files = (
+        project_info.get("files", [])
+        if project_info
+        else []
+    )
+
     return f"""
 You are an expert DevOps debugging agent.
 
@@ -567,6 +675,13 @@ Entry file:
 
 Project information:
 {project_info}
+
+Project file inventory:
+{project_files}
+
+Use this inventory as factual evidence of which files currently
+exist in the project. In particular, compare files referenced by
+Dockerfile COPY/ADD instructions against this inventory.
 
 ==================================================
 CURRENT DOCKER ERROR
@@ -664,10 +779,28 @@ For a container startup failure involving a missing file:
 
 If CMD/ENTRYPOINT is wrong, modify Dockerfile.
 
-If CMD/ENTRYPOINT is correct but the required file is excluded
-by .dockerignore, modify .dockerignore.
+If CMD/ENTRYPOINT is correct AND the required startup file exists
+in the project BUT is listed in .dockerignore, the .dockerignore
+entry is the PRIMARY root cause. Modify .dockerignore to remove
+that ignored file.
 
-If COPY/WORKDIR is responsible, modify Dockerfile.
+If the deterministic diagnostics explicitly report:
+
+"Startup target listed in .dockerignore: True"
+
+AND:
+
+"Startup target exists in project: True"
+
+AND the Docker error says that the startup target cannot be found
+inside the container, you MUST select .dockerignore as the fix
+target.
+
+In this situation, DO NOT modify CMD, ENTRYPOINT, Python
+interpreter, WORKDIR, or unrelated Dockerfile instructions.
+
+If COPY/WORKDIR is responsible and the startup file is NOT excluded
+by .dockerignore, modify Dockerfile.
 
 Do NOT change CMD merely because a file is missing.
 
@@ -724,8 +857,36 @@ as "old".
 
 Keep "old" minimal: preferably one exact line.
 
-For .dockerignore, if removing one ignored file, "old" should
-be exactly that current line.
+For .dockerignore, if removing one ignored file, "old" must be
+the exact line that currently exists in the CURRENT .dockerignore
+file, and "new" must be an empty string.
+
+==================================================
+GENERAL EDIT SEMANTICS
+==================================================
+
+The fix uses literal text replacement:
+
+"old" = the exact text that CURRENTLY EXISTS in the selected file.
+
+"new" = the exact text that should REPLACE "old".
+
+If an existing line must be removed:
+
+"old": "<exact existing line>"
+"new": ""
+
+If existing text must be changed:
+
+"old": "<exact existing text>"
+"new": "<replacement text>"
+
+NEVER use an empty "old" value to represent deletion.
+
+NEVER invent the "old" value.
+
+The actual "old" and "new" values MUST be derived from the
+CURRENT FILE CONTENT provided in this prompt.
 
 ==================================================
 STRICT "new" RULE

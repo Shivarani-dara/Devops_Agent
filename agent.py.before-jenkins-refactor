@@ -47,9 +47,7 @@ from tools.docker_tools import ensure_dockerfile
 
 from prompts.debug_prompts import (
     application_error_prompt,
-    test_failure_prompt,
-    docker_failure_prompt,
-    dockerignore_failure_prompt
+    test_failure_prompt,docker_failure_prompt
 )
 
 from tools.git_tools import (
@@ -377,7 +375,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
 
                             print("\n🎉 PROJECT SUCCESSFUL")
 
-                            return True
+                            break
 
 
                         # =================================================
@@ -564,7 +562,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
 
                         print("\n🎉 PROJECT SUCCESSFUL")
 
-                        return True
+                        break
 
 
                     else:
@@ -771,41 +769,17 @@ def run_agent_loop(project_path, project_info, state, llm_client):
             print("\n===== DOCKER STARTUP DIAGNOSTICS =====")
             print(docker_startup_diagnostics)
 
-            dockerignore_failure = (
-                "Startup target listed in .dockerignore: True"
-                in docker_startup_diagnostics
-                and
-                "Startup target exists in project: True"
-                in docker_startup_diagnostics
+            prompt = docker_failure_prompt(
+                project_path,
+                app_file,
+                state.error,
+                docker_source_code,
+                dockerfile_content,
+                dockerignore_content,
+                docker_startup_diagnostics,
+                project_info,
+                failed_fix_info=failed_fix_info
             )
-
-            if dockerignore_failure:
-
-                print(
-                    "\n===== SPECIALIZED .DOCKERIGNORE DEBUGGER ====="
-                )
-
-                prompt = dockerignore_failure_prompt(
-                    state.error,
-                    dockerignore_content,
-                    docker_startup_diagnostics,
-                    failed_fix_info=failed_fix_info
-                )
-
-            else:
-
-                prompt = docker_failure_prompt(
-                    project_path,
-                    app_file,
-                    state.error,
-                    docker_source_code,
-                    dockerfile_content,
-                    dockerignore_content,
-                    docker_startup_diagnostics,
-                    project_info,
-                    failed_fix_info=failed_fix_info
-                )
-
             prompt = state.extra_instructions + prompt
 
 
@@ -1780,7 +1754,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                         "\n🎉 FIX SUCCESSFUL"
                     )
 
-                    return True
+                    break
 
 
                 # =================================================
@@ -2176,7 +2150,8 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                     "\n🎉 FIX SUCCESSFUL"
                 )
 
-                return True
+
+                break
 
 
             # ====================================================
@@ -2290,37 +2265,45 @@ def run_jenkins_repair(
     jenkins_url="http://localhost:8080"
 ):
     """
-    Jenkins orchestration layer.
+    Diagnose and repair a failed Jenkins Pipeline.
 
-    Jenkins provides the external CI failure evidence.
-    The existing run_agent_loop() performs the actual project
-    debugging, validation, approval, modification, verification,
-    rollback, and commit for application/test/Docker failures.
+    Jenkins repair is iterative:
+        failed build
+            -> diagnostics
+            -> LLM diagnosis
+            -> LLM fix
+            -> validation
+            -> human approval
+            -> checkpoint
+            -> apply
+            -> commit/push
+            -> Jenkins rerun
+            -> next failed build, if any
 
-    Jenkinsfile/CI-pipeline failures remain Jenkins-specific.
+    A maximum of MAX_ATTEMPTS repair attempts is allowed.
     """
 
+    repo_root = Path(project_path).resolve()
+
     current_build_number = build_number
+
+    attempted_fixes = []
 
     print("\n========================================")
     print("       JENKINS REPAIR STARTED")
     print("========================================")
+
     print(f"\nJob: {job_name}")
     print(f"Initial failed build: #{current_build_number}")
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
 
         print("\n========================================")
-        print(
-            f"       JENKINS REPAIR ATTEMPT "
-            f"{attempt}/{MAX_ATTEMPTS}"
-        )
+        print(f"       JENKINS REPAIR ATTEMPT {attempt}/{MAX_ATTEMPTS}")
         print("========================================")
 
-        print(
-            f"\nAnalyzing Jenkins build "
-            f"#{current_build_number}"
-        )
+        print(f"\nJob: {job_name}")
+        print(f"Analyzing build: #{current_build_number}")
 
         # ========================================================
         # 1. COLLECT FRESH JENKINS DIAGNOSTICS
@@ -2343,7 +2326,7 @@ def run_jenkins_repair(
         print("✅ Jenkins diagnostics collected.")
 
         # ========================================================
-        # 2. CHECK CURRENT BUILD STATUS
+        # 2. CHECK WHETHER CURRENT BUILD ALREADY SUCCEEDED
         # ========================================================
 
         if diagnostics.get("status") == "SUCCESS":
@@ -2354,71 +2337,33 @@ def run_jenkins_repair(
             return True
 
         # ========================================================
-        # 3. DETERMINISTIC JENKINS FAILURE CLASSIFICATION
+        # 3. SHOW CURRENT FAILURE
+        # ========================================================
+
+        print("\n===== FAILED COMMAND =====")
+        print(diagnostics.get("failed_command", ""))
+
+        # ========================================================
+        # 4. ASK LLM FOR DIAGNOSIS
+        # ========================================================
+
+        print("\n===== ASKING AI FOR JENKINS DIAGNOSIS =====")
+
+        diagnosis = llm_client.generate_jenkins_diagnosis_from_context(
+            diagnostics
+        )
+
+        print("\n===== JENKINS DIAGNOSIS =====")
+        print(json.dumps(diagnosis, indent=2))
+
+        # ========================================================
+        # 5. HANDLE DETERMINISTIC INFRASTRUCTURE FAILURES
         # ========================================================
 
         docker_diagnostics = diagnostics.get(
             "docker_diagnostics",
             {}
         )
-
-        if docker_diagnostics.get("detected", False):
-
-            failure_type = "docker"
-
-            diagnosis = {
-                "failure_type": "docker",
-                "stage": diagnostics.get("failed_stage", ""),
-                "failed_command": diagnostics.get(
-                    "failed_command",
-                    ""
-                ),
-                "summary": docker_diagnostics.get(
-                    "evidence",
-                    ""
-                ),
-                "root_cause": docker_diagnostics.get(
-                    "evidence",
-                    ""
-                ),
-                "evidence": docker_diagnostics.get(
-                    "evidence",
-                    ""
-                ),
-                "recommended_action": (
-                    "Route the failure to the existing "
-                    "Docker debugging engine."
-                )
-            }
-
-            print(
-                "\n===== DETERMINISTIC JENKINS DIAGNOSIS ====="
-            )
-
-        else:
-
-            print(
-                "\n===== ASKING AI FOR JENKINS DIAGNOSIS ====="
-            )
-
-            diagnosis = (
-                llm_client.generate_jenkins_diagnosis_from_context(
-                    diagnostics
-                )
-            )
-
-            print("\n===== JENKINS DIAGNOSIS =====")
-            print(json.dumps(diagnosis, indent=2))
-
-            failure_type = (
-                diagnosis.get("failure_type", "")
-                .strip()
-                .lower()
-            )
-
-        # ========================================================
-        # 4. DETERMINISTIC INFRASTRUCTURE FAILURE
-        # ========================================================
 
         if docker_diagnostics.get(
             "infrastructure_failure",
@@ -2427,6 +2372,11 @@ def run_jenkins_repair(
 
             print(
                 "\n❌ Docker/BuildKit infrastructure failure detected."
+            )
+
+            print(
+                "The failure is not considered a project-code or "
+                "Dockerfile defect."
             )
 
             print(
@@ -2447,367 +2397,437 @@ def run_jenkins_repair(
             print(
                 diagnosis.get(
                     "recommended_action",
-                    "Repair the Jenkins/Docker infrastructure."
+                    "Repair the Docker/Jenkins infrastructure."
                 )
             )
 
             return False
 
         # ========================================================
-        # 5. ROUTE PROJECT FAILURES TO EXISTING AGENT
+        # 6. ASK LLM FOR FIX
         # ========================================================
 
-        project_failure_types = {
-            "docker",
-            "application",
-            "test",
-            "dependency"
-        }
+        print("\n===== SELECTING SPECIALIZED FIX GENERATOR =====")
 
-        if failure_type in project_failure_types:
+        failure_type = diagnosis.get("failure_type", "").lower()
+
+        if failure_type == "docker":
 
             print(
-                "\n===== ROUTING TO EXISTING DEBUGGING ENGINE ====="
+                "🔧 Routing Jenkins Docker failure to existing "
+                "Docker debugging machinery."
             )
 
-            print(
-                f"Failure type: {failure_type}"
+            dockerfile_path = Path(project_path) / "Dockerfile"
+            dockerignore_path = Path(project_path) / ".dockerignore"
+
+            dockerfile_content = (
+                dockerfile_path.read_text()
+                if dockerfile_path.exists()
+                else ""
             )
 
-            state = AgentState()
-
-            # Jenkins console output becomes the existing
-            # debugging error/context.
-            state.error = diagnostics.get(
-                "console_log",
-                ""
+            dockerignore_content = (
+                dockerignore_path.read_text()
+                if dockerignore_path.exists()
+                else ""
             )
 
-            state.last_error = state.error
-
-            # ----------------------------------------------------
-            # Docker
-            # ----------------------------------------------------
-
-            if failure_type == "docker":
-
-                debug_type = docker_diagnostics.get(
-                    "debug_type"
-                )
-
-                if debug_type == "docker_infrastructure":
-                    print(
-                        "\n❌ Docker infrastructure failure."
-                    )
-                    return False
-
-                state.stored_debug_type = (
-                    debug_type or "docker_build"
-                )
-
-                print(
-                    "Routing to existing Docker debugging path."
-                )
-
-            # ----------------------------------------------------
-            # Test
-            # ----------------------------------------------------
-
-            elif failure_type == "test":
-
-                state.stored_debug_type = "application"
-
-                test_result = {
-                    "stdout": diagnostics.get(
-                        "console_log",
-                        ""
-                    ),
-                    "stderr": diagnostics.get(
-                        "console_log",
-                        ""
-                    ),
-                    "returncode": 1
-                }
-
-                state.test_info = build_test_info(
-                    project_path,
-                    project_info,
-                    test_result
-                )
-
-                print(
-                    "Routing to existing test debugging path."
-                )
-
-            # ----------------------------------------------------
-            # Application / Dependency
-            # ----------------------------------------------------
-
-            else:
-
-                state.stored_debug_type = "application"
-
-                print(
-                    "Routing to existing application "
-                    "debugging path."
-                )
-
-            print(
-                "\n===== RUNNING EXISTING AGENT LOOP ====="
+            app_file = project_info.get(
+                "entry_point",
+                "app.py"
             )
 
-            repair_result = run_agent_loop(
+            app_path = Path(project_path) / app_file
+
+            docker_source_code = (
+                app_path.read_text()
+                if app_path.exists()
+                else ""
+            )
+
+            docker_diagnostics = analyze_docker_startup(
+                dockerfile_content,
                 project_path,
                 project_info,
-                state,
-                llm_client
+                dockerignore_content,
+                diagnostics.get("error", "")
             )
 
-            if not repair_result:
-                print(
-                    "\n❌ Existing debugging engine "
-                    "could not repair the Jenkins failure."
-                )
-                return False
+            print("\n===== JENKINS DOCKER STARTUP DIAGNOSTICS =====")
+            print(docker_diagnostics)
 
-            print(
-                "\n✅ Existing debugging engine "
-                "completed the repair."
+            prompt = docker_failure_prompt(
+                project_path,
+                app_file,
+                diagnostics.get("error", ""),
+                docker_source_code,
+                dockerfile_content,
+                dockerignore_content,
+                docker_diagnostics,
+                project_info,
+                failed_fix_info=None
             )
 
-            print(
-                "\n===== PUSHING EXISTING DEBUGGING FIX ====="
+            prompt = (
+                "This failure occurred during a Jenkins Docker "
+                "Build/Runtime stage. Use the Docker diagnostics "
+                "and propose a fix to the actual Docker-related "
+                "project file. Do not modify the Jenkins pipeline "
+                "unless the Jenkins pipeline itself is proven to "
+                "be the root cause.\n\n"
+                + prompt
             )
 
-            push_result = git_push(
-                str(Path(project_path).resolve()),
-                remote="origin",
-                branch="main"
-            )
+            fix = llm_client.generate_fix(prompt)
 
-            if not push_result["success"]:
+        elif failure_type == "jenkins":
 
-                print(
-                    "\n❌ Could not push debugging fix."
-                )
-                print(push_result["stderr"])
-
-                return False
-
-            print(
-                "✅ Existing debugging fix pushed to GitHub."
-            )
-
-            # ----------------------------------------------------
-            # The existing agent has already performed its
-            # validation, approval, modification, verification,
-            # rollback handling, and commit logic.
-            #
-            # Jenkins is now only responsible for rebuilding the
-            # project and verifying the real CI result.
-            # ----------------------------------------------------
-
-        # ========================================================
-        # 6. JENKINSFILE / CI PIPELINE FAILURE
-        # ========================================================
-
-        elif failure_type in (
-            "jenkins",
-            "ci_pipeline"
-        ):
-
-            print(
-                "\n===== JENKINS PIPELINE REPAIR ====="
-            )
+            print("🔧 Routing failure to Jenkins fix generator.")
 
             fix = llm_client.generate_jenkins_fix(
                 diagnostics,
                 diagnosis
             )
 
-            print("\n===== PROPOSED JENKINS FIX =====")
-            print(json.dumps(fix, indent=2))
-
-            if not isinstance(fix, dict):
-                print(
-                    "\n❌ LLM returned an invalid Jenkins fix."
-                )
-                return False
-
-            old_command = fix.get("old", "").strip()
-            new_command = fix.get("new", "").strip()
-
-            if not old_command or not new_command:
-                print(
-                    "\n❌ Jenkins fix is missing old/new command."
-                )
-                return False
-
-            jenkinsfile_path = project_info.get(
-                "jenkinsfile"
-            )
-
-            if not jenkinsfile_path:
-                print(
-                    "\n❌ Jenkinsfile was not detected."
-                )
-                return False
-
-            jenkinsfile_path = (
-                Path(project_path) / jenkinsfile_path
-            )
-
-            if not jenkinsfile_path.exists():
-                print("\n❌ Jenkinsfile not found.")
-                return False
-
-            jenkinsfile_content = (
-                jenkinsfile_path.read_text()
-            )
-
-            print("\n===== VALIDATING JENKINS FIX =====")
-
-            validation = validate_jenkins_fix(
-                jenkinsfile_content,
-                fix,
-                project_info
-            )
-
-            if not validation["valid"]:
-                print("\n❌ FIX REJECTED")
-                print(validation["reason"])
-                return False
-
-            print("\n✅ FIX PASSED VALIDATION")
-            print(validation["reason"])
-
-            print("\n===== JENKINS FIX =====")
-            print("\nOLD:")
-            print(old_command)
-            print("\nNEW:")
-            print(new_command)
-            print("\nREASON:")
-            print(fix.get("reason", ""))
-
-            choice = input(
-                "\nApply this Jenkins fix? [y/n]: "
-            )
-
-            if choice.lower() != "y":
-                print(
-                    "\n❌ Jenkins fix rejected by human."
-                )
-                return False
-
-            print(
-                "\n===== CREATING GIT CHECKPOINT ====="
-            )
-
-            checkpoint_result = git_checkpoint(
-                str(Path(project_path).resolve())
-            )
-
-            if not checkpoint_result["success"]:
-                print(
-                    "\n❌ Could not create Git checkpoint."
-                )
-                print(checkpoint_result["error"])
-                return False
-
-            checkpoint = checkpoint_result["checkpoint"]
-
-            print("\n===== UPDATING JENKINSFILE =====")
-
-            update_result = update_jenkinsfile(
-                str(jenkinsfile_path),
-                old_command,
-                new_command
-            )
-
-            if not update_result["success"]:
-
-                print("\n❌ Could not update Jenkinsfile.")
-                print(update_result["error"])
-
-                git_rollback(
-                    str(Path(project_path).resolve()),
-                    checkpoint
-                )
-
-                return False
-
-            print("✅ Jenkinsfile updated.")
-
-            print(
-                "\n===== COMMITTING JENKINSFILE FIX ====="
-            )
-
-            commit_result = git_commit_file(
-                str(Path(project_path).resolve()),
-                str(jenkinsfile_path),
-                "AI debugging fix: repair Jenkins pipeline"
-            )
-
-            if not commit_result["success"]:
-
-                print(
-                    "\n❌ Could not commit Jenkinsfile fix."
-                )
-                print(commit_result["stderr"])
-
-                git_rollback(
-                    str(Path(project_path).resolve()),
-                    checkpoint
-                )
-
-                return False
-
-            print("✅ Jenkinsfile fix committed.")
-
-            print(
-                "\n===== PUSHING JENKINSFILE FIX ====="
-            )
-
-            push_result = git_push(
-                str(Path(project_path).resolve()),
-                remote="origin",
-                branch="main"
-            )
-
-            if not push_result["success"]:
-
-                print("\n❌ Could not push Jenkinsfile fix.")
-                print(push_result["stderr"])
-
-                git_rollback(
-                    str(Path(project_path).resolve()),
-                    checkpoint
-                )
-
-                return False
-
-            print("✅ Jenkinsfile fix pushed to GitHub.")
-
-        # ========================================================
-        # 7. UNKNOWN FAILURE
-        # ========================================================
-
         else:
 
             print(
-                f"\n❌ Unsupported Jenkins failure type: "
-                f"{failure_type}"
+                f"❌ Unsupported Jenkins failure type: {failure_type}"
+            )
+
+            return False
+
+        print("\n===== PROPOSED JENKINS FIX =====")
+        print(json.dumps(fix, indent=2))
+
+        if not isinstance(fix, dict):
+            print("\n❌ LLM returned an invalid Jenkins fix.")
+            return False
+
+        old_command = fix.get("old", "").strip()
+        new_command = fix.get("new", "").strip()
+
+        if not old_command or not new_command:
+            print("\n❌ Jenkins fix is missing old/new command.")
+            return False
+
+        # ========================================================
+        # 6. PREVENT REPEATED IDENTICAL FIXES
+        # ========================================================
+
+        fix_signature = (
+            old_command,
+            new_command
+        )
+
+        if fix_signature in attempted_fixes:
+
+            print(
+                "\n❌ AI proposed the same Jenkins fix again."
+            )
+
+            print(f"OLD: {old_command}")
+            print(f"NEW: {new_command}")
+
+            print(
+                "\nStopping to prevent an infinite repair loop."
             )
 
             return False
 
         # ========================================================
-        # 8. TRIGGER JENKINS AGAIN
+        # 7. VALIDATE FIX USING EXISTING validator.py FUNCTIONS
         # ========================================================
 
-        print(
-            "\n===== TRIGGERING JENKINS BUILD ====="
+        if failure_type == "docker":
+
+            print("\n===== VALIDATING DOCKER FIX =====")
+
+            fix_file = fix.get("file", "").strip()
+
+            if not fix_file:
+                print("\n❌ Docker fix is missing target file.")
+                return False
+
+            target_path = Path(project_path) / fix_file
+
+            if not target_path.exists():
+                print(
+                    f"\n❌ Docker fix target does not exist: {fix_file}"
+                )
+                return False
+
+            current_content = target_path.read_text()
+
+            if fix_file == "Dockerfile":
+
+                validation = validate_dockerfile_fix(
+                    current_content,
+                    old_command,
+                    new_command
+                )
+
+            elif fix_file == ".dockerignore":
+
+                validation = validate_dockerignore_fix(
+                    current_content,
+                    old_command,
+                    new_command
+                )
+
+            elif fix_file == "requirements.txt":
+
+                validation = validate_requirements_fix(
+                    current_content,
+                    old_command,
+                    new_command
+                )
+
+            else:
+
+                validation = validate_python_fix(
+                    current_content,
+                    old_command,
+                    new_command
+                )
+
+        elif failure_type == "jenkins":
+
+            print("\n===== VALIDATING JENKINS FIX =====")
+
+            jenkinsfile_path = diagnostics["project_info"].get(
+                "jenkinsfile"
+            )
+
+            if jenkinsfile_path:
+
+                jenkinsfile_path = (
+                    Path(project_path) / jenkinsfile_path
+                )
+
+                if not jenkinsfile_path.exists():
+                    print("\n❌ Jenkinsfile not found.")
+                    return False
+
+                jenkins_pipeline_content = (
+                    jenkinsfile_path.read_text()
+                )
+
+            else:
+
+                jenkins_pipeline_content = diagnostics[
+                    "jenkins_config"
+                ]
+
+            validation = validate_jenkins_fix(
+                jenkins_pipeline_content,
+                fix,
+                diagnostics["project_info"]
+            )
+
+        else:
+
+            print(
+                f"\n❌ No validator available for: {failure_type}"
+            )
+            return False
+
+        if not validation["valid"]:
+
+            print("\n❌ FIX REJECTED")
+            print(validation["reason"])
+
+            return False
+
+        print("\n✅ FIX PASSED VALIDATION")
+        print(validation["reason"])
+
+
+        # ========================================================
+        # 8. SHOW FIX
+        # ========================================================
+
+        print("\n===== JENKINS FIX =====")
+
+        print("\nStage:")
+        print(fix.get("stage"))
+
+        print("\nOLD:")
+        print(fix["old"])
+
+        print("\nNEW:")
+        print(fix["new"])
+
+        print("\nREASON:")
+        print(fix["reason"])
+
+        # ========================================================
+        # 9. HUMAN APPROVAL
+        # ========================================================
+
+        choice = input(
+            "\nApply this Jenkins fix? [y/n]: "
         )
+
+        if choice.lower() != "y":
+
+            print(
+                "\n❌ Jenkins fix rejected by human."
+            )
+
+            return False
+
+        # ========================================================
+        # 10. CREATE GIT CHECKPOINT
+        # ========================================================
+
+        print("\n===== CREATING GIT CHECKPOINT =====")
+
+        checkpoint_result = git_checkpoint(
+            str(repo_root)
+        )
+
+        if not checkpoint_result["success"]:
+
+            print("\n❌ Could not create Git checkpoint.")
+            print(checkpoint_result["error"])
+
+            return False
+
+        checkpoint = checkpoint_result["checkpoint"]
+
+        print(
+            f"✅ Git checkpoint created: {checkpoint}"
+        )
+
+        # ========================================================
+        # 11. UPDATE JENKINSFILE
+        # ========================================================
+
+        print("\n===== UPDATING JENKINSFILE =====")
+
+        jenkinsfile_path = diagnostics[
+            "project_info"
+        ].get("jenkinsfile")
+
+        if not jenkinsfile_path:
+
+            print(
+                "\n❌ Jenkinsfile was not detected."
+            )
+
+            return False
+
+        jenkinsfile_path = Path(project_path) / jenkinsfile_path
+
+        update_result = update_jenkinsfile(
+            str(jenkinsfile_path),
+            fix["old"],
+            fix["new"],
+        )
+
+        if not update_result["success"]:
+
+            print("\n❌ Could not update Jenkinsfile.")
+            print(update_result["error"])
+
+            print("\n===== ROLLING BACK =====")
+
+            rollback_result = git_rollback(
+                str(repo_root),
+                checkpoint
+            )
+
+            if rollback_result["success"]:
+                print("✅ Rollback successful.")
+            else:
+                print("❌ Rollback failed.")
+                print(rollback_result["stderr"])
+
+            return False
+
+        print("✅ Jenkinsfile updated.")
+
+        # ========================================================
+        # 12. COMMIT JENKINSFILE FIX
+        # ========================================================
+
+        print("\n===== COMMITTING JENKINSFILE FIX =====")
+
+        commit_result = git_commit_file(
+            str(repo_root),
+            str(jenkinsfile_path),
+            "AI debugging fix: repair Jenkins pipeline"
+        )
+
+        if not commit_result["success"]:
+
+            print(
+                "\n❌ Could not commit Jenkinsfile fix."
+            )
+
+            print(commit_result["stderr"])
+
+            print("\n===== ROLLING BACK =====")
+
+            rollback_result = git_rollback(
+                str(repo_root),
+                checkpoint
+            )
+
+            if rollback_result["success"]:
+                print("✅ Rollback successful.")
+            else:
+                print("❌ Rollback failed.")
+                print(rollback_result["stderr"])
+
+            return False
+
+        print("✅ Jenkinsfile fix committed.")
+
+        # Record the fix only after the commit succeeded.
+        attempted_fixes.append(fix_signature)
+
+        # ========================================================
+        # 13. PUSH FIX
+        # ========================================================
+
+        print("\n===== PUSHING JENKINSFILE FIX =====")
+
+        push_result = git_push(
+            str(repo_root),
+            remote="origin",
+            branch="main"
+        )
+
+        if not push_result["success"]:
+
+            print("\n❌ Could not push Jenkinsfile fix.")
+            print(push_result["stderr"])
+
+            print("\n===== ROLLING BACK =====")
+
+            rollback_result = git_rollback(
+                str(repo_root),
+                checkpoint
+            )
+
+            if rollback_result["success"]:
+                print("✅ Rollback successful.")
+            else:
+                print("❌ Rollback failed.")
+                print(rollback_result["stderr"])
+
+            return False
+
+        print("✅ Jenkinsfile fix pushed to GitHub.")
+
+        # ========================================================
+        # 14. TRIGGER NEW JENKINS BUILD
+        # ========================================================
+
+        print("\n===== TRIGGERING JENKINS BUILD =====")
 
         trigger_result = trigger_jenkins_build(
             job_name,
@@ -2815,20 +2835,25 @@ def run_jenkins_repair(
         )
 
         if not trigger_result["success"]:
+
             print(
                 "\n❌ Could not trigger Jenkins build."
             )
+
             print(trigger_result["error"])
+
             return False
 
-        new_build_number = trigger_result["build_number"]
+        new_build_number = trigger_result[
+            "build_number"
+        ]
 
         print(
             f"✅ Jenkins build #{new_build_number} started."
         )
 
         # ========================================================
-        # 9. WAIT FOR JENKINS RESULT
+        # 15. WAIT FOR BUILD
         # ========================================================
 
         print(
@@ -2842,10 +2867,13 @@ def run_jenkins_repair(
         )
 
         if not build_result["success"]:
+
             print(
                 "\n❌ Error while waiting for Jenkins."
             )
+
             print(build_result["error"])
+
             return False
 
         print(
@@ -2855,7 +2883,7 @@ def run_jenkins_repair(
         )
 
         # ========================================================
-        # 10. SUCCESS
+        # 16. SUCCESS
         # ========================================================
 
         if build_result["status"] == "SUCCESS":
@@ -2871,7 +2899,7 @@ def run_jenkins_repair(
             return True
 
         # ========================================================
-        # 11. FAILURE -> FRESH ITERATION
+        # 17. FAILURE -> NEXT ITERATION
         # ========================================================
 
         print(
@@ -2887,11 +2915,15 @@ def run_jenkins_repair(
             return False
 
         print(
-            "\n🔄 The next iteration will collect the "
-            "new Jenkins failure and route it again."
+            "\n🔄 A new Jenkins failure will now be "
+            "analyzed from its own logs."
         )
 
         current_build_number = new_build_number
+
+    # ============================================================
+    # MAX ATTEMPTS
+    # ============================================================
 
     print(
         "\n❌ Jenkins repair stopped after "

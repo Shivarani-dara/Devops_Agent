@@ -149,10 +149,17 @@ def is_docker_infrastructure_error(docker_result):
         "connection refused",
         "connection reset",
         "network is unreachable",
-        "timeout",
-        "temporary failure",
-        "dns",
         "could not resolve host",
+
+        # Docker / BuildKit infrastructure failures
+        # Keep these specific: generic Docker build errors
+        # can be caused by a bad Dockerfile.
+        "parent snapshot",
+        "snapshot does not exist",
+        "failed to prepare extraction snapshot",
+        "connection to docker daemon failed",
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
     ]
 
     return any(

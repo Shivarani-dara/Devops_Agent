@@ -82,8 +82,13 @@ def scan_project(project_path):
     if ".dockerignore" in all_files:
         project_info["dockerignore"] = ".dockerignore"
 
-    if "Jenkinsfile" in all_files:
-        project_info["jenkinsfile"] = "Jenkinsfile"
+    jenkinsfiles = [
+        file for file in all_files
+        if os.path.basename(file) == "Jenkinsfile"
+    ]
+
+    if jenkinsfiles:
+        project_info["jenkinsfile"] = jenkinsfiles[0]
 
     # ============================================================
     # DETECT NODE.JS
@@ -184,6 +189,66 @@ def scan_project(project_path):
             project_info["test_framework"] = "pytest"
 
     return project_info
+
+
+def scan_repository(repository_path):
+    """
+    Discover project directories inside a repository.
+    """
+
+    if not os.path.isdir(repository_path):
+        raise ValueError(
+            f"Repository directory not found: {repository_path}"
+        )
+
+    project_markers = {
+        "package.json",
+        "pom.xml",
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "Dockerfile",
+        "Jenkinsfile",
+    }
+
+    discovered_projects = []
+
+    for root, dirs, files in os.walk(repository_path):
+
+        dirs[:] = [
+            d for d in dirs
+            if d not in {
+                ".git",
+                "__pycache__",
+                ".pytest_cache",
+                "venv",
+                ".venv",
+                "node_modules"
+            }
+        ]
+
+        strong_markers = {
+            "package.json",
+            "pom.xml",
+            "pyproject.toml",
+            "setup.py",
+            "Dockerfile",
+            "Jenkinsfile",
+        }
+
+        if any(file in strong_markers for file in files):
+
+            relative_path = os.path.relpath(
+                root,
+                repository_path
+            )
+
+            if relative_path == ".":
+                relative_path = ""
+
+            discovered_projects.append(relative_path)
+
+    return discovered_projects
 
 
 # ================================================================
