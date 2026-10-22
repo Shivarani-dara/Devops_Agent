@@ -341,6 +341,7 @@ def test_failure_prompt(
     code,
     test_info,
     source_files,
+    project_info=None,
     failed_fix_info=""
 ):
     project_files = (
@@ -357,7 +358,13 @@ The application runs, but automated tests are failing.
 Your task is to determine why the tests fail and propose ONE minimal
 source-code fix.
 
-Do not modify the tests.
+TEST FILES ARE READ-ONLY.
+
+You may read the test files to understand the expected behavior,
+but you MUST NOT modify them.
+
+The "file" field in your JSON response MUST refer to an available
+source file, not a test file.
 
 Do not guess.
 
@@ -601,14 +608,16 @@ If an existing ignored entry must be removed:
 - "old" MUST contain the exact existing ignored entry.
 - "new" MUST be an empty string.
 
-For the current situation, CURRENT .dockerignore contains:
+Use the ACTUAL CURRENT .dockerignore contents and deterministic
+diagnostics to identify the responsible rule.
 
-app.py
+Do not assume that app.py is excluded unless the evidence supports it.
+The responsible rule may be an exact filename, wildcard, or directory
+pattern. Do not remove a broad rule if a narrower, safe correction is
+possible.
 
-Therefore, if app.py is the entry causing the failure:
-
-- old MUST be: app.py
-- new MUST be empty
+If the responsible rule cannot be identified confidently, do not invent
+a patch. Return file="" and explain the uncertainty in the reason.
 
 NEVER use an empty "old" value.
 
@@ -802,7 +811,14 @@ interpreter, WORKDIR, or unrelated Dockerfile instructions.
 If COPY/WORKDIR is responsible and the startup file is NOT excluded
 by .dockerignore, modify Dockerfile.
 
-Do NOT change CMD merely because a file is missing.
+Do NOT change CMD merely because a file is missing when
+the startup target exists in the project and is excluded by
+.dockerignore.
+
+If the startup target does NOT exist in the project, is NOT
+excluded by .dockerignore, and the project entry file exists,
+inspect the current CMD/ENTRYPOINT. If it references the
+missing target, modify Dockerfile to use the existing entry file.
 
 Do NOT change .dockerignore merely because Docker failed.
 

@@ -30,6 +30,7 @@ from core.docker_validation import (
     validate_docker,
     analyze_docker_startup
 )
+from core.dockerignore_fix import select_dockerignore_fix
 
 
 
@@ -771,12 +772,22 @@ def run_agent_loop(project_path, project_info, state, llm_client):
             print("\n===== DOCKER STARTUP DIAGNOSTICS =====")
             print(docker_startup_diagnostics)
 
-            dockerignore_failure = (
+            startup_target_is_ignored = (
                 "Startup target listed in .dockerignore: True"
                 in docker_startup_diagnostics
                 and
                 "Startup target exists in project: True"
                 in docker_startup_diagnostics
+            )
+
+            project_entry_is_ignored = (
+                "Project entry file listed in .dockerignore: True"
+                in docker_startup_diagnostics
+            )
+
+            dockerignore_failure = (
+                startup_target_is_ignored
+                or project_entry_is_ignored
             )
 
             if dockerignore_failure:
@@ -821,6 +832,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                     "source_files",
                     []
                 ),
+                project_info=project_info,
                 failed_fix_info=failed_fix_info
             )
             prompt = state.extra_instructions + prompt
@@ -898,58 +910,44 @@ def run_agent_loop(project_path, project_info, state, llm_client):
 
 
         # ========================================================
-        # ASK LLM FOR FIX
+        # SELECT DETERMINISTIC DOCKERIGNORE FIX OR ASK THE LLM
         # ========================================================
 
-        print("\n===== ASKING AI FOR FIX =====")
+        fix = select_dockerignore_fix(
+            debug_type=debug_type,
+            diagnostics=docker_startup_diagnostics,
+            dockerignore_content=dockerignore_content,
+            project_info=project_info,
+            app_file=app_file,
+        )
 
+        if fix is not None:
+            print(
+                "\\n===== DETERMINISTIC DOCKERIGNORE FIX ====="
+                "\\nUsing verified diagnostics; skipping the LLM call."
+            )
 
-        try:
-
-            raw_response = llm_client.generate_fix(prompt)
-
-        except Exception as e:
-
-            print("\n❌ ERROR COMMUNICATING WITH AI")
-            print(e)
-
-            break
-
-
-        # ========================================================
-        # READ AI RESPONSE
-        # ========================================================
-
-        print("\n===== RAW AI RESPONSE =====")
-        print(raw_response)
-
-        # ========================================================
-        # PARSE JSON
-        # ========================================================
-
-        try:
-
-            fix = json.loads(raw_response)
-
-
-        except json.JSONDecodeError as e:
-
-            print("\n❌ AI returned invalid JSON")
-
-            print(e)
-
-
-            if state.attempt == MAX_ATTEMPTS:
-
-                print(
-                    "\n❌ Maximum attempts reached."
-                )
-
+        if fix is None:
+            print("\\n===== ASKING AI FOR FIX =====")
+            try:
+                raw_response = llm_client.generate_fix(prompt)
+            except Exception as e:
+                print("\\n❌ ERROR COMMUNICATING WITH AI")
+                print(e)
                 break
 
+            print("\\n===== RAW AI RESPONSE =====")
+            print(raw_response)
 
-            continue
-
+            try:
+                fix = json.loads(raw_response)
+            except json.JSONDecodeError as e:
+                print("\\n❌ AI returned invalid JSON")
+                print(e)
+                if state.attempt == MAX_ATTEMPTS:
+                    print("\\n❌ Maximum attempts reached.")
+                    break
+                continue
 
         # ========================================================
         # CHECK REQUIRED FIELDS
@@ -993,6 +991,94 @@ def run_agent_loop(project_path, project_info, state, llm_client):
 
 
         # ========================================================
+        # DETERMINISTIC DOCKER STARTUP TARGET CORRECTION
+        # ========================================================
+
+        if (
+            debug_type in ("docker_build", "docker_runtime")
+            and docker_startup_diagnostics
+        ):
+            def diagnostic_value(label):
+                for diagnostic_line in docker_startup_diagnostics.splitlines():
+                    if diagnostic_line.strip().startswith(label + ":"):
+                        return diagnostic_line.split(":", 1)[1].strip()
+                return ""
+
+            startup_target = (
+                diagnostic_value("CMD startup target")
+                or diagnostic_value("ENTRYPOINT startup target")
+            )
+            entry_file = (
+                diagnostic_value("Project entry file")
+                or project_info.get("entry_point", "")
+                or app_file
+            )
+            entry_file = os.path.basename(entry_file)
+
+            target_missing = (
+                diagnostic_value("Startup target exists in project")
+                == "False"
+            )
+            target_excluded = (
+                diagnostic_value("Startup target listed in .dockerignore")
+                == "True"
+            )
+            entry_excluded = (
+                diagnostic_value("Project entry file listed in .dockerignore")
+                == "True"
+            )
+
+            project_files = project_info.get("files", [])
+            entry_exists = (
+                bool(entry_file)
+                and entry_file in [
+                    os.path.basename(str(f)) for f in project_files
+                ]
+            )
+
+            startup_command = next(
+                (
+                    line
+                    for line in dockerfile_content.splitlines()
+                    if line.lstrip().upper().startswith(
+                        ("CMD ", "ENTRYPOINT ")
+                    )
+                ),
+                None,
+            )
+
+            if (
+                target_missing
+                and not target_excluded
+                and entry_exists
+                and startup_target
+                and startup_target in (startup_command or "")
+                and entry_file != startup_target
+            ):
+                corrected_command = startup_command.replace(
+                    startup_target, entry_file, 1
+                )
+
+                fix = {
+                    "file": "Dockerfile",
+                    "old": startup_command,
+                    "new": corrected_command,
+                    "reason": (
+                        f"The startup target '{startup_target}' does not "
+                        f"exist in the project. '{entry_file}' exists and "
+                        "is not listed in .dockerignore. Correct the "
+                        "Dockerfile startup command."
+                    ),
+                }
+
+                print(
+                    "\\n===== DETERMINISTIC DOCKER FIX ====="
+                    "\\nThe AI proposal is superseded by verified diagnostics."
+                    f"\\nFile: {fix['file']}"
+                    f"\\nOld: {fix['old']}"
+                    f"\\nNew: {fix['new']}"
+                )
+
         # HANDLE EXTERNAL DOCKER FAILURE
         # ========================================================
         if (
@@ -1023,7 +1109,10 @@ def run_agent_loop(project_path, project_info, state, llm_client):
         # REJECT REPEATED FIX
         # ========================================================
 
-        if is_repeated_fix(fix, state.failed_fixes):
+        if (
+            not fix.get("_deterministic", False)
+            and is_repeated_fix(fix, state.failed_fixes)
+        ):
             sig = fix_signature(fix)
             state.repeated_fix_counts[sig] = state.repeated_fix_counts.get(sig, 0) + 1
             count = state.repeated_fix_counts[sig]
@@ -1046,24 +1135,44 @@ def run_agent_loop(project_path, project_info, state, llm_client):
             print("🔄 Skipping validation. Asking AI for a different fix "
                 "with a stronger constraint...")
 
-            state.extra_instructions = f"""
+            if "docker" in str(debug_type).lower():
+                state.extra_instructions = f"""
+        REPEATED DOCKER FIX — DO NOT REPEAT THE PREVIOUS PATCH.
 
-        ==================================================
-        REPEATED FIX OVERRIDE — READ THIS FIRST
-        ==================================================
-        Your previous answer was IDENTICAL to a fix that was already
-        tried and failed:
-
+        Previous proposal:
         FILE: {fix["file"]}
-        OLD:  {fix["old"]}
-        NEW:  {fix["new"]}
+        OLD: {fix["old"]}
+        NEW: {fix["new"]}
 
-        You MUST NOT propose this exact change again.
-        Specifically, do NOT wrap values in str(), and do NOT use
-        string concatenation to "fix" this error. Consider whether
-        the correct fix is a numeric conversion (int()) instead, or
-        whether the bug is somewhere other than the operator itself.
+        Current deterministic Docker diagnostics:
+        {docker_startup_diagnostics}
+
+        If the startup target does not exist in the project and is not
+        excluded by .dockerignore, inspect the current Dockerfile CMD
+        or ENTRYPOINT. If it references the missing target, propose
+        changing that command to use the existing project entry file.
+
+        Only modify .dockerignore if diagnostics confirm that the
+        startup target exists in the project AND is excluded by it.
+
+        The old value must exactly match existing text in the selected
+        file. Do not repeat the previous patch. Return valid JSON only.
         """
+            else:
+                state.extra_instructions = f"""
+        REPEATED FIX — DO NOT REPEAT THE PREVIOUS PATCH.
+
+        Previous proposal:
+        FILE: {fix["file"]}
+        OLD: {fix["old"]}
+        NEW: {fix["new"]}
+
+        Re-evaluate the current error and file contents. Identify the
+        actual root cause and propose a different minimal valid fix.
+        The old value must exactly match existing text in the file.
+        Return valid JSON only.
+        """
+
             continue  # loop back and rebuild the prompt with extra_instructions
 
 
@@ -1196,9 +1305,19 @@ def run_agent_loop(project_path, project_info, state, llm_client):
         # BY MODIFYING APPLICATION SOURCE
         # ========================================================
 
+        deterministic_dockerignore_fix = (
+            fix.get("file") == ".dockerignore"
+            and fix.get("_deterministic") is True
+            and (
+                "Project entry file listed in .dockerignore: True"
+                in docker_startup_diagnostics
+            )
+        )
+
         if (
             debug_type == "docker_build"
             and fix["file"] not in ("Dockerfile", "")
+            and not deterministic_dockerignore_fix
         ):
 
             print(
@@ -1371,7 +1490,7 @@ def run_agent_loop(project_path, project_info, state, llm_client):
         )
 
 
-        if choice.lower() != "y":
+        if choice.strip().lower() != "y":
 
             print(
                 "\n❌ Fix rejected by human."
@@ -2212,7 +2331,6 @@ def run_agent_loop(project_path, project_info, state, llm_client):
                     + docker_result["build_stderr"]
 
                     + "\n\nDOCKER CONTAINER STDOUT:\n"
-
                     + docker_result["run_stdout"]
 
                     + "\n\nDOCKER CONTAINER STDERR:\n"
@@ -2362,9 +2480,11 @@ def run_jenkins_repair(
             {}
         )
 
-        if docker_diagnostics.get("detected", False):
+        failure_type = diagnostics.get(
+            "failure_type"
+        )
 
-            failure_type = "docker"
+        if failure_type == "docker":
 
             diagnosis = {
                 "failure_type": "docker",
@@ -2393,6 +2513,48 @@ def run_jenkins_repair(
 
             print(
                 "\n===== DETERMINISTIC JENKINS DIAGNOSIS ====="
+            )
+
+        elif failure_type in (
+            "test",
+            "dependency",
+            "application"
+        ):
+
+            diagnosis = {
+                "failure_type": failure_type,
+                "stage": diagnostics.get(
+                    "failed_stage",
+                    ""
+                ),
+                "failed_command": diagnostics.get(
+                    "failed_command",
+                    ""
+                ),
+                "summary": (
+                    f"Jenkins failure classified "
+                    f"deterministically as {failure_type}."
+                ),
+                "root_cause": (
+                    "Route the failure to the existing "
+                    f"{failure_type} debugging engine."
+                ),
+                "evidence": diagnostics.get(
+                    "console_log",
+                    ""
+                ),
+                "recommended_action": (
+                    f"Route the failure to the existing "
+                    f"{failure_type} debugging engine."
+                )
+            }
+
+            print(
+                "\n===== DETERMINISTIC JENKINS CLASSIFICATION ====="
+            )
+
+            print(
+                f"Failure type: {failure_type}"
             )
 
         else:
@@ -2693,7 +2855,7 @@ def run_jenkins_repair(
                 "\nApply this Jenkins fix? [y/n]: "
             )
 
-            if choice.lower() != "y":
+            if choice.strip().lower() != "y":
                 print(
                     "\n❌ Jenkins fix rejected by human."
                 )

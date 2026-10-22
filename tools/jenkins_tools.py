@@ -623,13 +623,38 @@ def collect_jenkins_diagnostics(
         failed_command or ""
     ).lower()
 
+    # ========================================================
+    # 5. DETERMINISTIC FAILURE CLASSIFICATION
+    # ========================================================
+
+    failure_type = None
+
+    if (
+        "docker build" in failed_command_lower
+        or "docker run" in failed_command_lower
+    ):
+        failure_type = "docker"
+
+    elif "pytest" in failed_command_lower:
+        failure_type = "test"
+
+    elif (
+        "pip install" in failed_command_lower
+        or "pip3 install" in failed_command_lower
+    ):
+        failure_type = "dependency"
+
+    elif (
+        "python " in failed_command_lower
+        or "python3 " in failed_command_lower
+    ):
+        failure_type = "application"
+
     console_lower = console_log.lower()
 
     is_docker_failure = (
         "docker build" in failed_command_lower
         or "docker run" in failed_command_lower
-        or "docker build" in console_lower
-        or "docker buildx" in console_lower
     )
 
     if is_docker_failure:
@@ -706,6 +731,7 @@ def collect_jenkins_diagnostics(
 
         "console_log": console_log,
         "failed_command": failed_command,
+        "failure_type": failure_type,
 
         "jenkins_config": config_result["config"],
 

@@ -4,6 +4,50 @@ import re
 from tools.docker_tools import build_and_run_docker
 
 
+def _dockerignore_match_status(filename, dockerignore):
+    """
+    Conservatively evaluate common .dockerignore rules for a root-level file.
+
+    This is not a complete implementation of Docker's pattern matcher.
+    Return True/False only for simple, unambiguous rules; otherwise None.
+    """
+    import fnmatch
+
+    rules = []
+    ambiguous = False
+
+    for raw_line in dockerignore.splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        if line == "!":
+            ambiguous = True
+            continue
+
+        negated = line.startswith("!")
+        pattern = line[1:] if negated else line
+
+        # Directory, rooted, nested, or parent-relative patterns need
+        # Docker's full matching semantics; don't guess about them.
+        if (
+            "/" in pattern
+            or pattern in (".", "..")
+            or not pattern
+        ):
+            ambiguous = True
+            continue
+
+        if fnmatch.fnmatchcase(filename, pattern):
+            rules.append(not negated)
+
+    if ambiguous:
+        return None
+
+    return rules[-1] if rules else False
+
+
 def analyze_docker_startup(
     dockerfile,
     project_path,
@@ -114,24 +158,36 @@ def analyze_docker_startup(
     # Check Dockerignore
     # --------------------------------------------------------
 
-    ignored_files = {
-        line.strip()
-        for line in dockerignore.splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    }
-
     if startup_target:
+        startup_file_path = os.path.join(
+            project_path,
+            startup_target
+        )
+
+        if os.path.exists(startup_file_path):
+            startup_ignored = _dockerignore_match_status(
+                startup_target,
+                dockerignore
+            )
+        else:
+            # A nonexistent project file cannot be the cause of its
+            # exclusion from the Docker build context.
+            startup_ignored = False
+
         diagnostics.append(
-            f"Startup target listed in .dockerignore: "
-            f"{startup_target in ignored_files}"
+            "Startup target listed in .dockerignore: "
+            f"{startup_ignored}"
         )
 
     if entry_point:
         entry_filename = os.path.basename(entry_point)
-
+        entry_ignored = _dockerignore_match_status(
+            entry_filename,
+            dockerignore
+        )
         diagnostics.append(
-            f"Project entry file listed in .dockerignore: "
-            f"{entry_filename in ignored_files}"
+            "Project entry file listed in .dockerignore: "
+            f"{entry_ignored}"
         )
 
     return "\n".join(diagnostics)
