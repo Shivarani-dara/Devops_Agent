@@ -244,6 +244,8 @@ def run_agent_loop(project_path, project_info, state, llm_client):
     
 
         state.attempt += 1
+        docker_startup_diagnostics = ""
+        dockerignore_content = ""
 
 
         print("\n==============================")
@@ -913,13 +915,16 @@ def run_agent_loop(project_path, project_info, state, llm_client):
         # SELECT DETERMINISTIC DOCKERIGNORE FIX OR ASK THE LLM
         # ========================================================
 
-        fix = select_dockerignore_fix(
-            debug_type=debug_type,
-            diagnostics=docker_startup_diagnostics,
-            dockerignore_content=dockerignore_content,
-            project_info=project_info,
-            app_file=app_file,
-        )
+        fix = None
+
+        if debug_type in ("docker_build", "docker_runtime"):
+            fix = select_dockerignore_fix(
+                debug_type=debug_type,
+                diagnostics=docker_startup_diagnostics,
+                dockerignore_content=dockerignore_content,
+                project_info=project_info,
+                app_file=app_file,
+            )
 
         if fix is not None:
             print(
@@ -1306,7 +1311,8 @@ def run_agent_loop(project_path, project_info, state, llm_client):
         # ========================================================
 
         deterministic_dockerignore_fix = (
-            fix.get("file") == ".dockerignore"
+            debug_type in ("docker_build", "docker_runtime")
+            and fix.get("file") == ".dockerignore"
             and fix.get("_deterministic") is True
             and (
                 "Project entry file listed in .dockerignore: True"
